@@ -1,0 +1,10 @@
+{
+  "id": "latency-trace",
+  "name": "Latency Trace",
+  "description": "Full-chain latency tracing with context size per model call.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
