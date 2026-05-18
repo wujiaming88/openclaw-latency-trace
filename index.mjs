@@ -47,6 +47,18 @@ function findRun(evt, ctx) {
   return null;
 }
 
+// Lookup-only — never creates a run. Used by terminal hooks (reply_dispatch,
+// message_sent) so a late event after flush cannot resurrect a phantom run.
+function lookupRun(evt, ctx) {
+  const runId = evt?.runId || ctx?.runId;
+  const sessionKey = evt?.sessionKey || ctx?.sessionKey;
+  if (runId && runs.has(runId)) return runs.get(runId);
+  if (sessionKey && sessionToRun.has(sessionKey)) {
+    return runs.get(sessionToRun.get(sessionKey)) || null;
+  }
+  return null;
+}
+
 function scheduleFlush(run, delayMs) {
   if (run._flushTimer) clearTimeout(run._flushTimer);
   run._flushTimer = setTimeout(() => flush(run), delayMs);
@@ -187,8 +199,25 @@ export default {
       scheduleFlush(r, AGENT_END_FLUSH_DELAY_MS);
     });
 
+    // Primary e2e/delivery endpoint. reply_dispatch carries runId+sessionKey on
+    // every channel; message_sent does not (OpenClaw 2026.5.12 deliver paths
+    // call buildCanonicalSentMessageHookContext without them). reply_dispatch
+    // is "first-claim wins" — handler must be read-only: no return value, no
+    // ctx mutation, errors swallowed.
+    api.on("reply_dispatch", (evt, ctx) => {
+      try {
+        const r = lookupRun(evt, ctx);
+        if (!r) return;
+        if (!r.messageSentAt) r.messageSentAt = Date.now();
+        cancelFlush(r);
+        flush(r);
+      } catch (_) {}
+    });
+
+    // Best-effort fallback: kept in case OpenClaw later threads runId through
+    // the deliver path. lookupRun avoids resurrecting a flushed run.
     api.on("message_sent", (evt, ctx) => {
-      const r = findRun(evt, ctx);
+      const r = lookupRun(evt, ctx);
       if (!r) return;
       r.messageSentAt = evt?.timestamp ?? Date.now();
       cancelFlush(r);

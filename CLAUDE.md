@@ -35,8 +35,9 @@ Subscribed events:
 | `before_prompt_build` | Captures `prompt` + `messages` UTF-8 bytes for the upcoming model call; cached on the run, drained onto the next `model_call_ended` detail |
 | `model_call_started` | Flushes stale runs; creates/updates the run record; backfills `agentStartAt`; stamps `provider`, `model` |
 | `model_call_ended` | Pushes a model-call detail entry (incl. cached `context`); updates `lastModelCallEndedAt` |
-| `agent_end` | Stamps `agentEndAt` (Agent → Delivery boundary); schedules a 15s fallback flush in case `message_sent` never arrives |
-| `message_sent` | Stamps `messageSentAt` (E2E end) and flushes immediately |
+| `agent_end` | Stamps `agentEndAt` (Agent → Delivery boundary); schedules a 15s fallback flush in case neither `reply_dispatch` nor `message_sent` arrives |
+| `reply_dispatch` | **Primary E2E / delivery endpoint.** evt carries `runId`/`sessionKey` on every channel. Stamps `messageSentAt` and flushes immediately. Hook is "first-claim wins" — handler is read-only (no return, no `ctx` mutation, errors swallowed). |
+| `message_sent` | Best-effort fallback. OpenClaw 2026.5.12 deliver paths call `buildCanonicalSentMessageHookContext` without `runId`/`sessionKey`, so this rarely resolves to a run today. Kept in case upstream threads them through later. |
 | `before_tool_call` | Cancels pending flush (defensive); starts the tool stopwatch |
 | `after_tool_call` | Pushes a tool-call detail entry |
 
@@ -52,11 +53,17 @@ model call and may carry different `messages` each time.
 State lives in a process-local `Map<runId, run>` plus a `Map<sessionKey, runId>`
 index for events whose `runId` arrives later than the wall-clock anchor. A run
 is flushed when:
-- `message_sent` fires (immediate flush — this is the normal path), or
-- 15s elapse after `agent_end` with no `message_sent` (fallback when delivery
-  fails or the gateway drops the event), or
+- `reply_dispatch` fires (immediate flush — primary path, channel-agnostic), or
+- `message_sent` fires with a resolvable `runId`/`sessionKey` (fallback path,
+  rarely hits in 2026.5.12 due to upstream not threading runId through deliver), or
+- 15s elapse after `agent_end` with no terminal hook (defensive timer for paths
+  where neither `reply_dispatch` nor `message_sent` carries the run), or
 - A new run starts (previous runs with model calls are flushed eagerly), or
 - The 60s sweeper finds a run older than 10 minutes.
+
+Terminal hooks (`reply_dispatch`, `message_sent`) use `lookupRun` (lookup-only)
+rather than `findRun` (lookup-or-create) so a late event arriving after flush
+cannot resurrect a phantom record.
 
 The `sessionKey → runId` index is retained for 60s after flush so a
 late-arriving event can still resolve to the (already-written) run id without
@@ -90,10 +97,10 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `runId` | string | OpenClaw run id |
 | `sessionKey` | string | OpenClaw session key |
 | `provider` | string | LLM provider id from first model call |
-| `e2eMs` | number\|null | `messageSentAt − messageReceivedAt` |
+| `e2eMs` | number\|null | `messageSentAt − messageReceivedAt`. `messageSentAt` comes from `reply_dispatch` (primary) or `message_sent` (fallback) — the moment OpenClaw is ready to dispatch the reply, not the moment the user receives it (channel-API delivery is outside the plugin's view, typically adds 100ms–1s). |
 | `stages.gatewayMs` | number\|null | `agentStartAt − messageReceivedAt` — upstream-delivery → agent-start latency (network + queueing; `messageReceivedAt` comes from `evt.timestamp`) |
 | `stages.agentRunMs` | number\|null | `(agentEndAt ?? lastModelCallEndedAt) − agentStartAt` |
-| `stages.deliveryMs` | number\|null | `messageSentAt − (agentEndAt ?? lastModelCallEndedAt)` |
+| `stages.deliveryMs` | number\|null | `messageSentAt − (agentEndAt ?? lastModelCallEndedAt)` — same `messageSentAt` provenance as `e2eMs`. |
 | `model.calls` | number | model call count |
 | `model.totalMs` | number | sum of model call durations |
 | `model.totalTtftMs` | number | sum of TTFTs |

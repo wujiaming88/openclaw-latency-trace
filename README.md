@@ -11,6 +11,8 @@
 - **工具执行耗时**：每次 tool call 的 duration
 - **上下文大小**：每次 model call 的 system / history / prompt UTF-8 字节数
 
+> `e2eMs` 和 `stages.deliveryMs` 的终点是 `reply_dispatch` hook（OpenClaw 准备投递时刻），跟用户实际收到消息差几百毫秒到 1 秒（channel API 实际投递时间，超出 plugin 视野）。
+
 ## 输出
 
 每次 agent run 完成后，写一条 JSON 到 `/tmp/openclaw/latency-trace.jsonl`。
@@ -60,6 +62,10 @@ jq 'select(.e2eMs != null) | {e2e: .e2eMs, gw: .stages.gatewayMs, ag: .stages.ag
 
 - OpenClaw ≥ 2026.5.12
 - 零依赖（只用 Node.js 内置模块）
+
+## 兼容性
+
+- `model.detail[].context.systemPromptBytes` 在 OpenClaw 2026.5.12 某些路径下可能为 0（OpenClaw `before_agent_run.evt.systemPrompt` 字段未填）。upstream 限制，需 OpenClaw 补齐 hook payload 才能修复。
 
 ## License
 
