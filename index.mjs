@@ -1,5 +1,6 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 const OUTPUT = process.env.LATENCY_TRACE_OUTPUT
   || join(process.env.OPENCLAW_LOG_DIR || "/tmp/openclaw", "latency-trace.jsonl");
@@ -11,7 +12,62 @@ const orphanReceived = new Map();
 const SESSION_INDEX_TTL_MS = 60_000;
 const ORPHAN_TTL_MS = 60_000;
 
+const TRAJECTORY_CACHE = new Map();
+const TRAJECTORY_CACHE_TTL_MS = 10_000;
+
 function utf8(s) { return Buffer.byteLength(s ?? "", "utf8"); }
+
+function inferAgentIdFromSessionKey(sessionKey) {
+  if (!sessionKey) return null;
+  const m = String(sessionKey).match(/^agent:([^:]+):/);
+  return m ? m[1] : null;
+}
+
+// systemPrompt char counts come from OpenClaw's own `systemPromptReport` (the
+// same numbers it logs as `[context-diag] systemPromptChars=...`). No plugin
+// hook in 2026.5.12 carries the report, so we read it from the trajectory
+// file. trajectory.jsonl truncates the systemPrompt *string* when chars
+// > 32768 (production runs are ~42K), so computing UTF-8 bytes from it is
+// unreliable — chars from the report are the authoritative number.
+function readSystemPromptInfo(agentId, sessionId) {
+  const fallback = { systemPromptChars: 0, projectContextChars: 0, nonProjectContextChars: 0 };
+  if (!agentId || !sessionId) return fallback;
+
+  try {
+    const file = join(homedir(), ".openclaw", "agents", agentId, "sessions", `${sessionId}.trajectory.jsonl`);
+    if (!existsSync(file)) return fallback;
+
+    const stat = statSync(file);
+    const cacheKey = `${agentId}:${sessionId}`;
+    const cached = TRAJECTORY_CACHE.get(cacheKey);
+    if (cached && cached.mtime === stat.mtimeMs && cached.expiresAt > Date.now()) {
+      return cached.info;
+    }
+
+    const raw = readFileSync(file, "utf8");
+    const lines = raw.split("\n");
+    let info = fallback;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      if (!line || !line.trim()) continue;
+      let evt;
+      try { evt = JSON.parse(line); } catch { continue; }
+      if (!evt || evt.type !== "trace.metadata") continue;
+      const r = evt?.data?.prompting?.systemPromptReport?.systemPrompt;
+      if (r && typeof r.chars === "number") {
+        info = {
+          systemPromptChars: r.chars || 0,
+          projectContextChars: r.projectContextChars || 0,
+          nonProjectContextChars: r.nonProjectContextChars || 0,
+        };
+        break;
+      }
+    }
+
+    TRAJECTORY_CACHE.set(cacheKey, { info, mtime: stat.mtimeMs, expiresAt: Date.now() + TRAJECTORY_CACHE_TTL_MS });
+    return info;
+  } catch (_) { return fallback; }
+}
 
 function getRun(runId, sessionKey) {
   if (!runId) return null;
@@ -23,7 +79,6 @@ function getRun(runId, sessionKey) {
       agentStartAt: null, agentEndAt: null, messageSentAt: null,
       lastModelCallEndedAt: null,
       provider: null, model: null,
-      systemPromptBytes: 0,
       modelCalls: [], toolCalls: [],
       _pendingContext: null, _toolT0: null, _toolName: null,
     });
@@ -134,20 +189,14 @@ export default {
       const r = findRun(evt, ctx);
       if (!r) return;
       if (!r.agentStartAt) r.agentStartAt = Date.now();
-      r.systemPromptBytes = utf8(evt?.systemPrompt);
     });
 
     api.on("before_prompt_build", (evt, ctx) => {
       const r = findRun(evt, ctx);
       if (!r) return;
-      const promptBytes = utf8(evt?.prompt);
-      const historyBytes = utf8(JSON.stringify(evt?.messages || []));
-      const sysBytes = r.systemPromptBytes ?? 0;
       r._pendingContext = {
-        systemPromptBytes: sysBytes,
-        promptBytes,
-        historyBytes,
-        totalContextBytes: sysBytes + promptBytes + historyBytes,
+        promptBytes: utf8(evt?.prompt),
+        historyBytes: utf8(JSON.stringify(evt?.messages || [])),
         imagesCount: 0,
       };
     });
@@ -165,19 +214,37 @@ export default {
       const r = findRun(evt, ctx);
       if (!r) return;
       r.lastModelCallEndedAt = Date.now();
-      const detail = {
+
+      const agentId = ctx?.agentId || inferAgentIdFromSessionKey(ctx?.sessionKey || evt?.sessionKey || r.sessionKey);
+      const sessionId = ctx?.sessionId || evt?.sessionId;
+      const info = readSystemPromptInfo(agentId, sessionId);
+
+      let context = r._pendingContext;
+      if (context) {
+        context.systemPromptChars = info.systemPromptChars;
+        context.projectContextChars = info.projectContextChars;
+        context.nonProjectContextChars = info.nonProjectContextChars;
+      } else {
+        context = {
+          systemPromptChars: info.systemPromptChars,
+          projectContextChars: info.projectContextChars,
+          nonProjectContextChars: info.nonProjectContextChars,
+          promptBytes: 0,
+          historyBytes: 0,
+          imagesCount: 0,
+        };
+      }
+
+      r.modelCalls.push({
         provider: evt.provider,
         model: evt.model,
         outcome: evt.outcome,
         durationMs: evt.durationMs,
         ttftMs: evt.timeToFirstByteMs ?? null,
         responseBytes: evt.responseStreamBytes ?? null,
-      };
-      if (r._pendingContext) {
-        detail.context = r._pendingContext;
-        r._pendingContext = null;
-      }
-      r.modelCalls.push(detail);
+        context,
+      });
+      r._pendingContext = null;
     });
 
     // E2E endpoint. OpenClaw 2026.5.12 has no post-delivery hook that carries

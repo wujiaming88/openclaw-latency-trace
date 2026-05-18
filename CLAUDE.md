@@ -14,7 +14,8 @@ JSONL file. Nothing else lives here.
    gateway recovery tools, generic setup helpers). If a tool is useful but not
    *this plugin*, it belongs in a different repo.
 2. **Zero npm dependencies.** Node.js built-ins only (`node:fs`, `node:path`,
-   `node:util`). Do not add `dependencies` or `devDependencies` to package.json.
+   `node:os`, `node:util`). Do not add `dependencies` or `devDependencies` to
+   package.json.
 3. **No bloat in README.** README structure is fixed: capabilities → install →
    verify → jq recipes → env vars → requirements → license. Do not pad it.
 4. **No project scaffolding.** No CI, no GitHub Actions, no issue templates, no
@@ -31,22 +32,22 @@ Subscribed events:
 | Event | What it does |
 |---|---|
 | `message_received` | Stamps `messageReceivedAt` (E2E start). If runId is unknown yet, parks an orphan keyed by sessionKey for later attach |
-| `before_agent_run` | Stamps `agentStartAt` (Gateway → Agent boundary). Captures `systemPromptBytes` once per run from `evt.systemPrompt` |
+| `before_agent_run` | Stamps `agentStartAt` (Gateway → Agent boundary) |
 | `before_prompt_build` | Captures `prompt` + `messages` UTF-8 bytes for the upcoming model call; cached on the run, drained onto the next `model_call_ended` detail |
 | `model_call_started` | Flushes stale runs; creates/updates the run record; backfills `agentStartAt`; stamps `provider`, `model` |
-| `model_call_ended` | Pushes a model-call detail entry (incl. cached `context`); updates `lastModelCallEndedAt` |
+| `model_call_ended` | Reads `systemPromptReport` chars from the trajectory file, merges with cached prompt/history bytes, pushes a model-call detail entry; updates `lastModelCallEndedAt` |
 | `agent_end` | Stamps `agentEndAt` **and** `messageSentAt` (treated as the E2E endpoint — see *Why no delivery latency*); flushes immediately |
 | `before_tool_call` | Starts the tool stopwatch |
 | `after_tool_call` | Pushes a tool-call detail entry |
 
 Hook choice rationale: the legacy `llm_input` hook is gated by
 `!skipPromptSubmission && !isRawModelRun && hasHooks("llm_input")` in OpenClaw
-≥ 2026.5.12 and silently no-ops on the Feishu / Bedrock embedded path. The pair
-`before_agent_run` (run-level systemPrompt) + `before_prompt_build` (per-call
-prompt + messages) is gated only by `hasHooks(...)` and reliably fires on every
-production path we've observed. This is why context lives on `model.detail[i]`
-(per-call) rather than at the run level — `before_prompt_build` fires once per
-model call and may carry different `messages` each time.
+≥ 2026.5.12 and silently no-ops on the Feishu / Bedrock embedded path.
+`before_prompt_build` (per-call prompt + messages) is gated only by
+`hasHooks(...)` and reliably fires on every production path we've observed.
+This is why context lives on `model.detail[i]` (per-call) rather than at the
+run level — `before_prompt_build` fires once per model call and may carry
+different `messages` each time.
 
 State lives in a process-local `Map<runId, run>` plus a `Map<sessionKey, runId>`
 index for events whose `runId` arrives later than the wall-clock anchor. A run
@@ -111,11 +112,48 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `model.totalGenerationMs` | number | totalMs − totalTtftMs |
 | `model.avgTtftMs` | number\|null | mean TTFT |
 | `model.firstCallTtftMs` | number\|null | TTFT of first model call |
-| `model.detail[]` | array | per-call: `{provider, model, outcome, durationMs, ttftMs, responseBytes, context?}` |
-| `model.detail[].context` | object | UTF-8 bytes captured at `before_prompt_build` (+ `systemPromptBytes` from `before_agent_run`): `{systemPromptBytes, promptBytes, historyBytes, totalContextBytes, imagesCount}`. `imagesCount` is `0` until `before_prompt_build` carries one |
+| `model.detail[]` | array | per-call: `{provider, model, outcome, durationMs, ttftMs, responseBytes, context}` |
+| `model.detail[].context` | object | `{systemPromptChars, projectContextChars, nonProjectContextChars, promptBytes, historyBytes, imagesCount}`. **Mixed units** — see *How systemPrompt chars are read* below |
 | `tools.calls` | number | tool call count |
 | `tools.totalMs` | number | sum of tool durations |
 | `tools.detail[]` | array | per-call: `{name, durationMs, error}` |
+
+## How systemPrompt chars are read
+
+OpenClaw 2026.5.12 has no plugin hook that carries the `systemPromptReport`,
+and the systemPrompt string itself is delivered to `before_agent_run` only on
+some code paths (the Feishu / Bedrock embedded path leaves it unset).
+trajectory.jsonl truncates the string when chars > 32768 — production runs
+typically sit at ~42K chars, so even when the trajectory contains the
+systemPrompt it's stored as `{truncated:true, originalChars, limitChars}`
+rather than the literal string. Computing UTF-8 bytes from that is just
+guessing.
+
+OpenClaw itself emits a `trace.metadata` event into the trajectory file with
+the authoritative chars breakdown — the same numbers it logs as
+`[context-diag] systemPromptChars=...`. We read those directly:
+
+- **File path:** `~/.openclaw/agents/<agentId>/sessions/<sessionId>.trajectory.jsonl`
+- **When:** on every `model_call_ended` (mtime + 10s TTL cache so a long
+  conversation doesn't re-parse the same file on every model call)
+- **Lookup:** scan lines bottom-up for `type === "trace.metadata"`, read
+  `data.prompting.systemPromptReport.systemPrompt.{chars, projectContextChars, nonProjectContextChars}`
+- **agentId / sessionId:** from `ctx.agentId` / `ctx.sessionId` if the harness
+  populates them; otherwise `agentId` is parsed from the sessionKey
+  (`agent:<agentId>:...`) and `sessionId` falls back to `evt.sessionId`. If
+  either is missing or the file doesn't exist yet, all three chars fields
+  return `0` — the plugin never throws.
+
+### Why mixed units (chars + bytes)
+
+- `systemPromptChars` is **chars** because the trajectory only gives us chars
+  (no bytes), and chars match what OpenClaw logs internally.
+- `promptBytes` / `historyBytes` are **bytes** because `before_prompt_build`
+  hands us raw strings and `Buffer.byteLength(..., "utf8")` is the most
+  honest local measurement we can do.
+- We don't fake a unified field. Users who want a total run `jq
+  '.context.promptBytes + .context.historyBytes'` and look at chars
+  separately.
 
 ## Compatibility
 
