@@ -8,7 +8,7 @@ set -euo pipefail
 OTEL_VERSION="0.104.0"
 OTEL_DIR="/opt/otelcol"
 OTEL_OUTPUT="/tmp/openclaw/otel"
-OTEL_PORT="4318"
+OTEL_PORT="4319"
 OPENCLAW_CONFIG="${OPENCLAW_CONFIG:-$HOME/.openclaw/openclaw.json}"
 
 echo "🦞 OpenClaw Latency Trace — 环境搭建"
@@ -52,7 +52,7 @@ receivers:
   otlp:
     protocols:
       http:
-        endpoint: "127.0.0.1:4318"
+        endpoint: "127.0.0.1:4319"
 
 exporters:
   file/traces:
