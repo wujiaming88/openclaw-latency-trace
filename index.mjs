@@ -8,7 +8,6 @@ try { mkdirSync(dirname(OUTPUT), { recursive: true }); } catch (_) {}
 const runs = new Map();
 const sessionToRun = new Map();
 const orphanReceived = new Map();
-const AGENT_END_FLUSH_DELAY_MS = 15_000;
 const SESSION_INDEX_TTL_MS = 60_000;
 const ORPHAN_TTL_MS = 60_000;
 
@@ -27,7 +26,6 @@ function getRun(runId, sessionKey) {
       systemPromptBytes: 0,
       modelCalls: [], toolCalls: [],
       _pendingContext: null, _toolT0: null, _toolName: null,
-      _flushTimer: null,
     });
     if (sessionKey) orphanReceived.delete(sessionKey);
   }
@@ -47,8 +45,12 @@ function findRun(evt, ctx) {
   return null;
 }
 
-// Lookup-only — never creates a run. Used by terminal hooks (reply_dispatch,
-// message_sent) so a late event after flush cannot resurrect a phantom run.
+// Lookup-only — never creates a run. Reserved for a future terminal hook that
+// fires *after* channel-API delivery and carries runId/sessionKey. OpenClaw
+// 2026.5.12 has no such hook (message_sent omits runId in deliver paths;
+// reply_dispatch is an entry-claim hook), so this helper is currently unused.
+// Kept so reviving the post-delivery endpoint is a one-line handler, not a
+// refactor.
 function lookupRun(evt, ctx) {
   const runId = evt?.runId || ctx?.runId;
   const sessionKey = evt?.sessionKey || ctx?.sessionKey;
@@ -59,30 +61,18 @@ function lookupRun(evt, ctx) {
   return null;
 }
 
-function scheduleFlush(run, delayMs) {
-  if (run._flushTimer) clearTimeout(run._flushTimer);
-  run._flushTimer = setTimeout(() => flush(run), delayMs);
-}
-
-function cancelFlush(run) {
-  if (run._flushTimer) { clearTimeout(run._flushTimer); run._flushTimer = null; }
-}
-
 function flush(run) {
-  if (run._flushTimer) { clearTimeout(run._flushTimer); run._flushTimer = null; }
   const modelMs = run.modelCalls.reduce((s, c) => s + (c.durationMs || 0), 0);
   const modelTtft = run.modelCalls.reduce((s, c) => s + (c.ttftMs || 0), 0);
   const toolMs = run.toolCalls.reduce((s, c) => s + (c.durationMs || 0), 0);
 
   const agentEndAt = run.agentEndAt ?? run.lastModelCallEndedAt;
-  const e2eMs = (run.messageReceivedAt && run.messageSentAt)
-    ? run.messageSentAt - run.messageReceivedAt : null;
   const gatewayMs = (run.messageReceivedAt && run.agentStartAt)
     ? run.agentStartAt - run.messageReceivedAt : null;
   const agentRunMs = (run.agentStartAt && agentEndAt)
     ? agentEndAt - run.agentStartAt : null;
-  const deliveryMs = (agentEndAt && run.messageSentAt)
-    ? run.messageSentAt - agentEndAt : null;
+  const e2eMs = (gatewayMs != null && agentRunMs != null)
+    ? gatewayMs + agentRunMs : null;
 
   const record = {
     ts: new Date().toISOString(),
@@ -90,7 +80,7 @@ function flush(run) {
     sessionKey: run.sessionKey,
     provider: run.provider,
     e2eMs,
-    stages: { gatewayMs, agentRunMs, deliveryMs },
+    stages: { gatewayMs, agentRunMs },
     model: {
       calls: run.modelCalls.length,
       totalMs: modelMs,
@@ -166,7 +156,6 @@ export default {
       flushPreviousRuns(evt.runId);
       const r = getRun(evt.runId, evt.sessionKey || ctx?.sessionKey);
       if (!r) return;
-      cancelFlush(r);
       if (!r.agentStartAt) r.agentStartAt = Date.now();
       r.provider = evt.provider;
       r.model = evt.model;
@@ -191,42 +180,21 @@ export default {
       r.modelCalls.push(detail);
     });
 
+    // E2E endpoint. OpenClaw 2026.5.12 has no post-delivery hook that carries
+    // runId, so agent completion is treated as the e2e terminator. Trade-off:
+    // misses the channel-API send leg (typically 100ms–1s), which is outside
+    // this plugin's view anyway.
     api.on("agent_end", (evt, ctx) => {
       const r = findRun(evt, ctx);
       if (!r) return;
       if (!r.agentEndAt) r.agentEndAt = Date.now();
-      cancelFlush(r);
-      scheduleFlush(r, AGENT_END_FLUSH_DELAY_MS);
-    });
-
-    // Primary e2e/delivery endpoint. reply_dispatch carries runId+sessionKey on
-    // every channel; message_sent does not (OpenClaw 2026.5.12 deliver paths
-    // call buildCanonicalSentMessageHookContext without them). reply_dispatch
-    // is "first-claim wins" — handler must be read-only: no return value, no
-    // ctx mutation, errors swallowed.
-    api.on("reply_dispatch", (evt, ctx) => {
-      try {
-        const r = lookupRun(evt, ctx);
-        if (!r) return;
-        if (!r.messageSentAt) r.messageSentAt = Date.now();
-        cancelFlush(r);
-        flush(r);
-      } catch (_) {}
-    });
-
-    // Best-effort fallback: kept in case OpenClaw later threads runId through
-    // the deliver path. lookupRun avoids resurrecting a flushed run.
-    api.on("message_sent", (evt, ctx) => {
-      const r = lookupRun(evt, ctx);
-      if (!r) return;
-      r.messageSentAt = evt?.timestamp ?? Date.now();
-      cancelFlush(r);
+      if (!r.messageSentAt) r.messageSentAt = r.agentEndAt;
       flush(r);
     });
 
     api.on("before_tool_call", (evt, ctx) => {
       const r = findRun(evt, ctx);
-      if (r) { cancelFlush(r); r._toolT0 = Date.now(); r._toolName = evt.toolName; }
+      if (r) { r._toolT0 = Date.now(); r._toolName = evt.toolName; }
     });
 
     api.on("after_tool_call", (evt, ctx) => {

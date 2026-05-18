@@ -35,10 +35,8 @@ Subscribed events:
 | `before_prompt_build` | Captures `prompt` + `messages` UTF-8 bytes for the upcoming model call; cached on the run, drained onto the next `model_call_ended` detail |
 | `model_call_started` | Flushes stale runs; creates/updates the run record; backfills `agentStartAt`; stamps `provider`, `model` |
 | `model_call_ended` | Pushes a model-call detail entry (incl. cached `context`); updates `lastModelCallEndedAt` |
-| `agent_end` | Stamps `agentEndAt` (Agent → Delivery boundary); schedules a 15s fallback flush in case neither `reply_dispatch` nor `message_sent` arrives |
-| `reply_dispatch` | **Primary E2E / delivery endpoint.** evt carries `runId`/`sessionKey` on every channel. Stamps `messageSentAt` and flushes immediately. Hook is "first-claim wins" — handler is read-only (no return, no `ctx` mutation, errors swallowed). |
-| `message_sent` | Best-effort fallback. OpenClaw 2026.5.12 deliver paths call `buildCanonicalSentMessageHookContext` without `runId`/`sessionKey`, so this rarely resolves to a run today. Kept in case upstream threads them through later. |
-| `before_tool_call` | Cancels pending flush (defensive); starts the tool stopwatch |
+| `agent_end` | Stamps `agentEndAt` **and** `messageSentAt` (treated as the E2E endpoint — see *Why no delivery latency*); flushes immediately |
+| `before_tool_call` | Starts the tool stopwatch |
 | `after_tool_call` | Pushes a tool-call detail entry |
 
 Hook choice rationale: the legacy `llm_input` hook is gated by
@@ -53,29 +51,36 @@ model call and may carry different `messages` each time.
 State lives in a process-local `Map<runId, run>` plus a `Map<sessionKey, runId>`
 index for events whose `runId` arrives later than the wall-clock anchor. A run
 is flushed when:
-- `reply_dispatch` fires (immediate flush — primary path, channel-agnostic), or
-- `message_sent` fires with a resolvable `runId`/`sessionKey` (fallback path,
-  rarely hits in 2026.5.12 due to upstream not threading runId through deliver), or
-- 15s elapse after `agent_end` with no terminal hook (defensive timer for paths
-  where neither `reply_dispatch` nor `message_sent` carries the run), or
+- `agent_end` fires (immediate flush — the e2e endpoint), or
 - A new run starts (previous runs with model calls are flushed eagerly), or
-- The 60s sweeper finds a run older than 10 minutes.
-
-Terminal hooks (`reply_dispatch`, `message_sent`) use `lookupRun` (lookup-only)
-rather than `findRun` (lookup-or-create) so a late event arriving after flush
-cannot resurrect a phantom record.
+- The 60s sweeper finds a run older than 10 minutes (covers the case where
+  `agent_end` never fires, e.g. abort).
 
 The `sessionKey → runId` index is retained for 60s after flush so a
 late-arriving event can still resolve to the (already-written) run id without
 spawning a phantom record.
 
-If `agent_end` never fires, `agentRunMs` falls back to
-`lastModelCallEndedAt − agentStartAt`. Any missing time anchor produces `null`
-for the affected stage; the run still flushes.
+If `agent_end` never fires, the run is flushed by the 10-minute sweeper, with
+`agentRunMs` falling back to `lastModelCallEndedAt − agentStartAt`. Any missing
+time anchor produces `null` for the affected stage; the run still flushes.
 
 Flush appends one JSON line via `appendFileSync` and removes the run from the
 Map. Failures are swallowed silently (best-effort tracing must never break the
 gateway).
+
+## Why no delivery latency
+
+OpenClaw 2026.5.12 does not expose `runId` in any hook that fires after
+channel-API delivery. `message_sent` payloads omit `runId` in
+`deliverOutboundPayloads`; `reply_dispatch` is an entry-claim hook that fires
+*before* the agent run starts (used for "first-claim wins" routing decisions),
+not an exit signal. This plugin therefore treats `agent_end` as the e2e
+endpoint, accepting a few-hundred-ms inaccuracy (the channel-API send leg is
+outside the plugin's view).
+
+If OpenClaw upstream later adds `runId` to a post-delivery hook, the
+`lookupRun` helper is preserved in `index.mjs` for a one-line revival —
+register the new hook, call `lookupRun`, stamp `messageSentAt`, flush.
 
 ## Files
 
@@ -97,10 +102,9 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `runId` | string | OpenClaw run id |
 | `sessionKey` | string | OpenClaw session key |
 | `provider` | string | LLM provider id from first model call |
-| `e2eMs` | number\|null | `messageSentAt − messageReceivedAt`. `messageSentAt` comes from `reply_dispatch` (primary) or `message_sent` (fallback) — the moment OpenClaw is ready to dispatch the reply, not the moment the user receives it (channel-API delivery is outside the plugin's view, typically adds 100ms–1s). |
+| `e2eMs` | number\|null | `agentEndAt − messageReceivedAt` (== `stages.gatewayMs + stages.agentRunMs`). Does **not** include the channel-API send leg — see *Why no delivery latency* |
 | `stages.gatewayMs` | number\|null | `agentStartAt − messageReceivedAt` — upstream-delivery → agent-start latency (network + queueing; `messageReceivedAt` comes from `evt.timestamp`) |
 | `stages.agentRunMs` | number\|null | `(agentEndAt ?? lastModelCallEndedAt) − agentStartAt` |
-| `stages.deliveryMs` | number\|null | `messageSentAt − (agentEndAt ?? lastModelCallEndedAt)` — same `messageSentAt` provenance as `e2eMs`. |
 | `model.calls` | number | model call count |
 | `model.totalMs` | number | sum of model call durations |
 | `model.totalTtftMs` | number | sum of TTFTs |

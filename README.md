@@ -4,14 +4,14 @@
 
 ## 采集指标
 
-- **E2E 延迟**：从 Gateway 收到消息到回复发出（`e2eMs`）
-- **阶段拆分**：上游送达 → Agent 处理 → 回复发出（`stages.{gatewayMs,agentRunMs,deliveryMs}`）。`gatewayMs` 指上游送达 → Agent 开始处理的延迟（含网络/排队，由 `evt.timestamp` 决定）
+- **E2E 延迟**：从 Gateway 收到消息到 agent 完成回复（`e2eMs`）。不含 channel API 投递的最后几百毫秒（OpenClaw 上游未在投递路径暴露 runId 关联，无法测量）
+- **阶段拆分**：Gateway 开销 → Agent 处理（`stages.{gatewayMs,agentRunMs}`）。`gatewayMs` 指上游送达 → Agent 开始处理的延迟（含网络/排队，由 `evt.timestamp` 决定）
 - **模型 TTFT**：每次 model call 的 Time To First Byte（精确值，来自 streaming 层）
 - **模型生成时间**：duration − TTFT = 纯 token 生成耗时
 - **工具执行耗时**：每次 tool call 的 duration
 - **上下文大小**：每次 model call 的 system / history / prompt UTF-8 字节数
 
-> `e2eMs` 和 `stages.deliveryMs` 的终点是 `reply_dispatch` hook（OpenClaw 准备投递时刻），跟用户实际收到消息差几百毫秒到 1 秒（channel API 实际投递时间，超出 plugin 视野）。
+> `e2eMs` 终点是 `agent_end` hook（agent 完成回复时刻），跟用户实际收到消息差几百毫秒到 1 秒（channel API 实际投递时间，OpenClaw 上游限制 plugin 无法获取）。
 
 ## 输出
 
@@ -47,8 +47,8 @@ jq '.model.firstCallTtftMs' /tmp/openclaw/latency-trace.jsonl | sort -n | awk '{
 # Context size vs TTFT
 jq -r '.model.detail[] | select(.ttftMs != null and .context != null) | [.context.totalContextBytes, .ttftMs] | @csv' /tmp/openclaw/latency-trace.jsonl
 
-# 阶段拆分占比（gateway / agent / delivery）
-jq 'select(.e2eMs != null) | {e2e: .e2eMs, gw: .stages.gatewayMs, ag: .stages.agentRunMs, dl: .stages.deliveryMs}' /tmp/openclaw/latency-trace.jsonl
+# 阶段拆分占比（gateway / agent）
+jq 'select(.e2eMs != null) | {e2e: .e2eMs, gw: .stages.gatewayMs, ag: .stages.agentRunMs}' /tmp/openclaw/latency-trace.jsonl
 ```
 
 ## 环境变量
