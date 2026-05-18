@@ -30,15 +30,26 @@ Subscribed events:
 
 | Event | What it does |
 |---|---|
-| `model_call_started` | Flushes stale runs; creates/updates the run record; stamps `agentStartAt`, `provider`, `model` |
-| `model_call_ended` | Pushes a model-call detail entry; schedules a flush in `FLUSH_DELAY_MS` (3s) |
+| `message_received` | Stamps `messageReceivedAt` (E2E start). If runId is unknown yet, parks an orphan keyed by sessionKey for later attach |
+| `before_agent_run` | Stamps `agentStartAt` (Gateway → Agent boundary) |
+| `llm_input` | Captures system / prompt / history UTF-8 bytes; cached on the run, drained onto the next `model_call_ended` detail |
+| `model_call_started` | Flushes stale runs; creates/updates the run record; backfills `agentStartAt`; stamps `provider`, `model` |
+| `model_call_ended` | Pushes a model-call detail entry (incl. cached `context`); updates `lastModelCallEndedAt`; schedules a flush in `FLUSH_DELAY_MS` (3s) |
+| `agent_end` | Stamps `agentEndAt` (Agent → Delivery boundary) |
+| `message_sent` | Stamps `messageSentAt` (E2E end) |
 | `before_tool_call` | Cancels pending flush; starts the tool stopwatch |
 | `after_tool_call` | Pushes a tool-call detail entry |
 
-State lives in a process-local `Map<runId, run>`. A run is flushed when:
+State lives in a process-local `Map<runId, run>` plus a `Map<sessionKey, runId>`
+index for events whose `runId` arrives later than the wall-clock anchor. A run
+is flushed when:
 - 3s elapse after the last `model_call_ended` with no further activity, or
 - A new run starts (previous runs with model calls are flushed eagerly), or
 - The 60s sweeper finds a run older than 10 minutes.
+
+If `agent_end` never fires, `agentRunMs` falls back to
+`lastModelCallEndedAt − agentStartAt`. Any missing time anchor produces `null`
+for the affected stage; the run still flushes.
 
 Flush appends one JSON line via `appendFileSync` and removes the run from the
 Map. Failures are swallowed silently (best-effort tracing must never break the
@@ -64,20 +75,21 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `runId` | string | OpenClaw run id |
 | `sessionKey` | string | OpenClaw session key |
 | `provider` | string | LLM provider id from first model call |
-| `agentRunMs` | number\|null | now − `agentStartAt` (first `model_call_started`) |
+| `e2eMs` | number\|null | `messageSentAt − messageReceivedAt` |
+| `stages.gatewayMs` | number\|null | `agentStartAt − messageReceivedAt` |
+| `stages.agentRunMs` | number\|null | `(agentEndAt ?? lastModelCallEndedAt) − agentStartAt` |
+| `stages.deliveryMs` | number\|null | `messageSentAt − (agentEndAt ?? lastModelCallEndedAt)` |
 | `model.calls` | number | model call count |
 | `model.totalMs` | number | sum of model call durations |
 | `model.totalTtftMs` | number | sum of TTFTs |
 | `model.totalGenerationMs` | number | totalMs − totalTtftMs |
 | `model.avgTtftMs` | number\|null | mean TTFT |
 | `model.firstCallTtftMs` | number\|null | TTFT of first model call |
-| `model.detail[]` | array | per-call: `{provider, model, outcome, durationMs, ttftMs, requestBytes, responseBytes}` |
+| `model.detail[]` | array | per-call: `{provider, model, outcome, durationMs, ttftMs, responseBytes, context?}` |
+| `model.detail[].context` | object | UTF-8 bytes from `llm_input`: `{systemPromptBytes, promptBytes, historyBytes, totalContextBytes, imagesCount}` |
 | `tools.calls` | number | tool call count |
 | `tools.totalMs` | number | sum of tool durations |
 | `tools.detail[]` | array | per-call: `{name, durationMs, error}` |
-
-Note: top-level `model` is overwritten with the aggregate object (the earlier
-string assignment is shadowed by design — keep the object form).
 
 ## Compatibility
 

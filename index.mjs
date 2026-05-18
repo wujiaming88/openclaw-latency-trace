@@ -6,19 +6,43 @@ const OUTPUT = process.env.LATENCY_TRACE_OUTPUT
 try { mkdirSync(dirname(OUTPUT), { recursive: true }); } catch (_) {}
 
 const runs = new Map();
+const sessionToRun = new Map();
+const orphanReceived = new Map();
 const FLUSH_DELAY_MS = 3000;
+const ORPHAN_TTL_MS = 60_000;
+
+function utf8(s) { return Buffer.byteLength(s ?? "", "utf8"); }
 
 function getRun(runId, sessionKey) {
+  if (!runId) return null;
   if (!runs.has(runId)) {
+    const orphan = sessionKey ? orphanReceived.get(sessionKey) : null;
     runs.set(runId, {
       runId, sessionKey, createdAt: Date.now(),
-      agentStartAt: null, provider: null, model: null,
-      modelCalls: [], toolCalls: [], _toolT0: null, _flushTimer: null,
+      messageReceivedAt: orphan?.at ?? null,
+      agentStartAt: null, agentEndAt: null, messageSentAt: null,
+      lastModelCallEndedAt: null,
+      provider: null, model: null,
+      modelCalls: [], toolCalls: [],
+      _pendingContext: null, _toolT0: null, _toolName: null,
+      _flushTimer: null,
     });
+    if (sessionKey) orphanReceived.delete(sessionKey);
   }
   const r = runs.get(runId);
   if (sessionKey && !r.sessionKey) r.sessionKey = sessionKey;
+  if (sessionKey) sessionToRun.set(sessionKey, runId);
   return r;
+}
+
+function findRun(evt, ctx) {
+  const runId = evt?.runId || ctx?.runId;
+  const sessionKey = evt?.sessionKey || ctx?.sessionKey;
+  if (runId) return getRun(runId, sessionKey);
+  if (sessionKey && sessionToRun.has(sessionKey)) {
+    return runs.get(sessionToRun.get(sessionKey)) || null;
+  }
+  return null;
 }
 
 function scheduleFlush(run) {
@@ -32,19 +56,27 @@ function cancelFlush(run) {
 
 function flush(run) {
   if (run._flushTimer) { clearTimeout(run._flushTimer); run._flushTimer = null; }
-  const now = Date.now();
   const modelMs = run.modelCalls.reduce((s, c) => s + (c.durationMs || 0), 0);
   const modelTtft = run.modelCalls.reduce((s, c) => s + (c.ttftMs || 0), 0);
   const toolMs = run.toolCalls.reduce((s, c) => s + (c.durationMs || 0), 0);
-  const agentRunMs = run.agentStartAt ? now - run.agentStartAt : null;
+
+  const agentEndAt = run.agentEndAt ?? run.lastModelCallEndedAt;
+  const e2eMs = (run.messageReceivedAt && run.messageSentAt)
+    ? run.messageSentAt - run.messageReceivedAt : null;
+  const gatewayMs = (run.messageReceivedAt && run.agentStartAt)
+    ? run.agentStartAt - run.messageReceivedAt : null;
+  const agentRunMs = (run.agentStartAt && agentEndAt)
+    ? agentEndAt - run.agentStartAt : null;
+  const deliveryMs = (agentEndAt && run.messageSentAt)
+    ? run.messageSentAt - agentEndAt : null;
 
   const record = {
     ts: new Date().toISOString(),
     runId: run.runId,
     sessionKey: run.sessionKey,
     provider: run.provider,
-    model: run.model,
-    agentRunMs,
+    e2eMs,
+    stages: { gatewayMs, agentRunMs, deliveryMs },
     model: {
       calls: run.modelCalls.length,
       totalMs: modelMs,
@@ -58,6 +90,9 @@ function flush(run) {
   };
   try { appendFileSync(OUTPUT, JSON.stringify(record) + "\n"); } catch (_) {}
   runs.delete(run.runId);
+  if (run.sessionKey && sessionToRun.get(run.sessionKey) === run.runId) {
+    sessionToRun.delete(run.sessionKey);
+  }
 }
 
 function flushPreviousRuns(currentRunId) {
@@ -69,45 +104,92 @@ function flushPreviousRuns(currentRunId) {
 setInterval(() => {
   const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [id, run] of runs) { if (run.createdAt < cutoff) flush(run); }
+  const orphanCutoff = Date.now() - ORPHAN_TTL_MS;
+  for (const [key, o] of orphanReceived) { if (o.at < orphanCutoff) orphanReceived.delete(key); }
 }, 60_000).unref();
 
 export default {
   id: "latency-trace",
   register(api) {
-    api.on("model_call_started", (evt) => {
+    api.on("message_received", (evt, ctx) => {
+      const at = evt?.timestamp ?? Date.now();
+      const runId = evt?.runId || ctx?.runId;
+      const sessionKey = evt?.sessionKey || ctx?.sessionKey;
+      if (runId) {
+        const r = getRun(runId, sessionKey);
+        if (r && !r.messageReceivedAt) r.messageReceivedAt = at;
+      } else if (sessionKey) {
+        orphanReceived.set(sessionKey, { at });
+      }
+    });
+
+    api.on("before_agent_run", (evt, ctx) => {
+      const r = findRun(evt, ctx);
+      if (r && !r.agentStartAt) r.agentStartAt = Date.now();
+    });
+
+    api.on("llm_input", (evt, ctx) => {
+      const r = findRun(evt, ctx);
+      if (!r) return;
+      const systemPromptBytes = utf8(evt.systemPrompt);
+      const promptBytes = utf8(evt.prompt);
+      const historyBytes = utf8(JSON.stringify(evt.historyMessages || []));
+      r._pendingContext = {
+        systemPromptBytes,
+        promptBytes,
+        historyBytes,
+        totalContextBytes: systemPromptBytes + promptBytes + historyBytes,
+        imagesCount: evt.imagesCount ?? 0,
+      };
+    });
+
+    api.on("model_call_started", (evt, ctx) => {
       flushPreviousRuns(evt.runId);
-      const r = getRun(evt.runId, evt.sessionKey);
+      const r = getRun(evt.runId, evt.sessionKey || ctx?.sessionKey);
+      if (!r) return;
       cancelFlush(r);
       if (!r.agentStartAt) r.agentStartAt = Date.now();
       r.provider = evt.provider;
       r.model = evt.model;
     });
 
-    api.on("model_call_ended", (evt) => {
-      if (!evt.runId) return;
-      const r = runs.get(evt.runId);
+    api.on("model_call_ended", (evt, ctx) => {
+      const r = findRun(evt, ctx);
       if (!r) return;
-      r.modelCalls.push({
+      r.lastModelCallEndedAt = Date.now();
+      const detail = {
         provider: evt.provider,
         model: evt.model,
         outcome: evt.outcome,
         durationMs: evt.durationMs,
         ttftMs: evt.timeToFirstByteMs ?? null,
-        requestBytes: evt.requestPayloadBytes ?? null,
         responseBytes: evt.responseStreamBytes ?? null,
-      });
+      };
+      if (r._pendingContext) {
+        detail.context = r._pendingContext;
+        r._pendingContext = null;
+      }
+      r.modelCalls.push(detail);
       scheduleFlush(r);
     });
 
-    api.on("before_tool_call", (evt) => {
-      if (!evt.runId) return;
-      const r = runs.get(evt.runId);
+    api.on("agent_end", (evt, ctx) => {
+      const r = findRun(evt, ctx);
+      if (r && !r.agentEndAt) r.agentEndAt = Date.now();
+    });
+
+    api.on("message_sent", (evt, ctx) => {
+      const r = findRun(evt, ctx);
+      if (r) r.messageSentAt = evt?.timestamp ?? Date.now();
+    });
+
+    api.on("before_tool_call", (evt, ctx) => {
+      const r = findRun(evt, ctx);
       if (r) { cancelFlush(r); r._toolT0 = Date.now(); r._toolName = evt.toolName; }
     });
 
-    api.on("after_tool_call", (evt) => {
-      if (!evt.runId) return;
-      const r = runs.get(evt.runId);
+    api.on("after_tool_call", (evt, ctx) => {
+      const r = findRun(evt, ctx);
       if (!r) return;
       r.toolCalls.push({
         name: evt.toolName || r._toolName,

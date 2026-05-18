@@ -4,12 +4,12 @@
 
 ## 采集指标
 
-- **E2E 延迟**：从 Gateway 收到消息到回复发出
-- **阶段拆分**：Gateway 开销 / Agent run / 消息投递
+- **E2E 延迟**：从 Gateway 收到消息到回复发出（`e2eMs`）
+- **阶段拆分**：Gateway / Agent run / Delivery（`stages.{gatewayMs,agentRunMs,deliveryMs}`）
 - **模型 TTFT**：每次 model call 的 Time To First Byte（精确值，来自 streaming 层）
-- **模型生成时间**：duration - TTFT = 纯 token 生成耗时
+- **模型生成时间**：duration − TTFT = 纯 token 生成耗时
 - **工具执行耗时**：每次 tool call 的 duration
-- **上下文大小**：每次 model call 时的 system prompt / history / prompt 字符数
+- **上下文大小**：每次 model call 的 system / history / prompt UTF-8 字节数
 
 ## 输出
 
@@ -43,10 +43,10 @@ tail -1 /tmp/openclaw/latency-trace.jsonl | jq .
 jq '.model.firstCallTtftMs' /tmp/openclaw/latency-trace.jsonl | sort -n | awk '{a[NR]=$1}END{print "P50="a[int(NR*0.5)]" P95="a[int(NR*0.95)]}'
 
 # Context size vs TTFT
-jq -r '.model.detail[] | select(.ttftMs != null and .context != null) | [.context.totalContextChars, .ttftMs] | @csv' /tmp/openclaw/latency-trace.jsonl
+jq -r '.model.detail[] | select(.ttftMs != null and .context != null) | [.context.totalContextBytes, .ttftMs] | @csv' /tmp/openclaw/latency-trace.jsonl
 
-# 时间花在哪？
-jq '{e2e: .e2eMs, model_pct: (.model.totalMs/.e2eMs*100|floor), tool_pct: (.tools.totalMs/.e2eMs*100|floor)}' /tmp/openclaw/latency-trace.jsonl
+# 阶段拆分占比（gateway / agent / delivery）
+jq 'select(.e2eMs != null) | {e2e: .e2eMs, gw: .stages.gatewayMs, ag: .stages.agentRunMs, dl: .stages.deliveryMs}' /tmp/openclaw/latency-trace.jsonl
 ```
 
 ## 环境变量
