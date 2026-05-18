@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""分析 OpenClaw OTel traces，提取 context size → TTFT 对应关系。
+"""分析 OpenClaw OTel traces，提取 context size → TTFT / latency 对应关系。
+
+兼容 diagnostics-otel 2026.5.7 和 2026.5.12 两种 span 格式。
 
 用法：
     python3 analyze-latency.py [traces.jsonl路径]
@@ -19,16 +21,22 @@ DEFAULT_PATH = "/tmp/openclaw/otel/traces.jsonl"
 
 
 def get_attr(span: Dict, key: str) -> Optional[Any]:
-    """从 span attributes 里取值。"""
     for a in span.get("attributes", []):
         if a["key"] == key:
             v = a.get("value", {})
-            return v.get("intValue") or v.get("stringValue") or v.get("doubleValue")
+            return v.get("intValue") or v.get("stringValue") or v.get("doubleValue") or v.get("boolValue")
     return None
 
 
-def parse_traces(path: str) -> Dict[str, Dict]:
-    """按 traceId 聚合所有 spans。"""
+def span_duration_ms(span: Dict) -> Optional[int]:
+    start = int(span.get("startTimeUnixNano", 0))
+    end = int(span.get("endTimeUnixNano", 0))
+    if start and end:
+        return round((end - start) / 1e6)
+    return None
+
+
+def parse_traces(path: str) -> Dict[str, List[Dict]]:
     traces: Dict[str, List[Dict]] = defaultdict(list)
     with open(path) as f:
         for line in f:
@@ -45,151 +53,184 @@ def parse_traces(path: str) -> Dict[str, Dict]:
 
 
 def extract_runs(traces: Dict[str, List[Dict]]) -> List[Dict]:
-    """从每个 trace 提取一条分析记录。"""
     runs = []
     for trace_id, spans in traces.items():
         run: Dict[str, Any] = {
             "traceId": trace_id[:16],
+            "e2eMs": None,
             "context": None,
             "model_calls": [],
             "tool_calls": [],
+            "provider": None,
+            "model": None,
         }
 
         for span in spans:
             name = span.get("name", "")
+            dur = span_duration_ms(span)
 
-            if name == "openclaw.context.assembled":
+            # E2E: openclaw_request (2026.5.7) or message.processed
+            if name == "openclaw_request":
+                e2e = get_attr(span, "request.duration_ms")
+                run["e2eMs"] = int(e2e) if e2e else dur
+
+            # Model call: "llm_call" (2026.5.7) or "openclaw.model.call" (2026.5.12)
+            elif name == "llm_call" or name == "openclaw.model.call":
+                call = {
+                    "durationMs": dur,
+                    "provider": get_attr(span, "gen_ai.provider.name") or get_attr(span, "openclaw.provider"),
+                    "model": get_attr(span, "gen_ai.request.model") or get_attr(span, "openclaw.model"),
+                    "inputTokens": None,
+                    "outputTokens": None,
+                    "cacheReadTokens": None,
+                    "totalTokens": None,
+                    "stopReason": get_attr(span, "llm.stop.reason"),
+                    "ttftMs": None,
+                    "requestBytes": None,
+                    "responseBytes": None,
+                }
+                # Token usage (2026.5.7 format)
+                inp = get_attr(span, "gen_ai.usage.input_tokens")
+                out = get_attr(span, "gen_ai.usage.output_tokens")
+                total = get_attr(span, "gen_ai.usage.total_tokens")
+                cache_read = get_attr(span, "gen_ai.usage.cache_read_input_tokens")
+                cache_write = get_attr(span, "gen_ai.usage.cache_creation_input_tokens")
+                if inp: call["inputTokens"] = int(inp)
+                if out: call["outputTokens"] = int(out)
+                if total: call["totalTokens"] = int(total)
+                if cache_read: call["cacheReadTokens"] = int(cache_read)
+
+                # TTFT (2026.5.12 format)
+                ttft = get_attr(span, "openclaw.model_call.time_to_first_byte_ms")
+                if ttft: call["ttftMs"] = int(ttft)
+
+                # Request/response bytes (2026.5.12 format)
+                req = get_attr(span, "openclaw.model_call.request_bytes")
+                resp = get_attr(span, "openclaw.model_call.response_bytes")
+                if req: call["requestBytes"] = int(req)
+                if resp: call["responseBytes"] = int(resp)
+
+                run["model_calls"].append(call)
+                if not run["provider"]:
+                    run["provider"] = call["provider"]
+                    run["model"] = call["model"]
+
+            # Context assembled (2026.5.12 only)
+            elif name == "openclaw.context.assembled":
                 run["context"] = {
                     "systemPromptChars": get_attr(span, "openclaw.context.system_prompt_chars"),
                     "historyTextChars": get_attr(span, "openclaw.context.history_text_chars"),
                     "messageCount": get_attr(span, "openclaw.context.message_count"),
                     "promptChars": get_attr(span, "openclaw.context.prompt_chars"),
                     "tokenBudget": get_attr(span, "openclaw.context.token_budget"),
-                    "provider": get_attr(span, "openclaw.provider"),
-                    "model": get_attr(span, "openclaw.model"),
                 }
 
-            elif name == "openclaw.model.call":
-                ttft = get_attr(span, "openclaw.model_call.time_to_first_byte_ms")
-                req_bytes = get_attr(span, "openclaw.model_call.request_bytes")
-                resp_bytes = get_attr(span, "openclaw.model_call.response_bytes")
-                # duration from span timestamps
-                start_ns = int(span.get("startTimeUnixNano", 0))
-                end_ns = int(span.get("endTimeUnixNano", 0))
-                duration_ms = (end_ns - start_ns) / 1e6 if start_ns and end_ns else None
-                run["model_calls"].append({
-                    "ttftMs": int(ttft) if ttft else None,
-                    "durationMs": round(duration_ms) if duration_ms else None,
-                    "requestBytes": int(req_bytes) if req_bytes else None,
-                    "responseBytes": int(resp_bytes) if resp_bytes else None,
-                    "provider": get_attr(span, "openclaw.provider"),
-                    "model": get_attr(span, "openclaw.model"),
-                })
-
-            elif name == "openclaw.tool.execution":
-                start_ns = int(span.get("startTimeUnixNano", 0))
-                end_ns = int(span.get("endTimeUnixNano", 0))
-                duration_ms = (end_ns - start_ns) / 1e6 if start_ns and end_ns else None
+            # Tool execution
+            elif name in ("openclaw.tool.execution", "tool_call"):
                 run["tool_calls"].append({
-                    "tool": get_attr(span, "openclaw.tool"),
-                    "durationMs": round(duration_ms) if duration_ms else None,
+                    "tool": get_attr(span, "openclaw.tool") or get_attr(span, "tool.name"),
+                    "durationMs": dur,
                 })
 
-        if run["model_calls"]:
+            # LLM loop (2026.5.7) — contains aggregated usage for the whole run
+            elif name.startswith("llm loop:"):
+                # Extract total usage from the loop span
+                inp = get_attr(span, "gen_ai.usage.input_tokens")
+                out = get_attr(span, "gen_ai.usage.output_tokens")
+                total = get_attr(span, "gen_ai.usage.total_tokens")
+                cache_read = get_attr(span, "gen_ai.usage.cache_read_input_tokens")
+                if total and not run.get("_loop_total_tokens"):
+                    run["_loop_total_tokens"] = int(total)
+                    run["_loop_input_tokens"] = int(inp) if inp else None
+                    run["_loop_cache_read"] = int(cache_read) if cache_read else None
+
+        if run["model_calls"] or run["e2eMs"]:
             runs.append(run)
 
     return runs
 
 
 def print_report(runs: List[Dict]):
-    """打印分析报告。"""
-    print("━" * 76)
+    print("━" * 80)
     print("  🦞  OPENCLAW LATENCY ANALYSIS")
     print(f"  Runs: {len(runs)}")
-    print("━" * 76)
+    print("━" * 80)
     print()
 
-    # ── Summary table ──
-    print(f"{'trace':<12} {'ctx_chars':>10} {'msgs':>6} {'calls':>6} {'1st_TTFT':>10} {'avg_TTFT':>10} {'total_ms':>10}")
-    print("─" * 76)
-
-    all_pairs = []  # (context_chars, ttft_ms)
+    print(f"{'trace':<12} {'e2e_ms':>8} {'model':>20} {'calls':>6} {'total_tok':>10} {'1st_dur':>8} {'ttft':>8}")
+    print("─" * 80)
 
     for run in runs:
-        ctx = run["context"]
         calls = run["model_calls"]
-        ttfts = [c["ttftMs"] for c in calls if c["ttftMs"] is not None]
-        durations = [c["durationMs"] for c in calls if c["durationMs"] is not None]
-
-        ctx_chars = int(ctx["systemPromptChars"] or 0) + int(ctx["historyTextChars"] or 0) if ctx else None
-        msg_count = ctx["messageCount"] if ctx else None
-        first_ttft = ttfts[0] if ttfts else None
-        avg_ttft = round(sum(ttfts) / len(ttfts)) if ttfts else None
-        total_ms = sum(durations) if durations else None
+        e2e = run["e2eMs"] or "?"
+        model = (run["model"] or "?")[:20]
+        total_tok = run.get("_loop_total_tokens") or (calls[0]["totalTokens"] if calls and calls[0].get("totalTokens") else "?")
+        first_dur = f"{calls[0]['durationMs']}ms" if calls and calls[0].get("durationMs") else "?"
+        ttft = f"{calls[0]['ttftMs']}ms" if calls and calls[0].get("ttftMs") else "N/A"
 
         print(
             f"{run['traceId']:<12} "
-            f"{ctx_chars or '?':>10} "
-            f"{msg_count or '?':>6} "
+            f"{e2e:>8} "
+            f"{model:>20} "
             f"{len(calls):>6} "
-            f"{f'{first_ttft}ms' if first_ttft else '?':>10} "
-            f"{f'{avg_ttft}ms' if avg_ttft else '?':>10} "
-            f"{f'{total_ms}ms' if total_ms else '?':>10}"
+            f"{total_tok:>10} "
+            f"{first_dur:>8} "
+            f"{ttft:>8}"
         )
 
-        # Collect pairs for correlation
-        if ctx_chars and first_ttft:
-            all_pairs.append((int(ctx_chars), int(first_ttft)))
-        for c in calls:
-            if c["requestBytes"] and c["ttftMs"]:
-                all_pairs.append((int(c["requestBytes"]), int(c["ttftMs"])))
-
-    print()
-    print("━" * 76)
-    print("  CONTEXT SIZE vs TTFT (scatter data)")
-    print("━" * 76)
-    print()
-    print(f"{'context_size':>14} {'ttft_ms':>10}")
-    print("─" * 30)
-    for ctx_size, ttft in sorted(all_pairs):
-        print(f"{ctx_size:>14,} {ttft:>8,}ms")
-
-    if len(all_pairs) >= 3:
-        # Simple correlation
-        xs = [p[0] for p in all_pairs]
-        ys = [p[1] for p in all_pairs]
-        n = len(xs)
-        mean_x = sum(xs) / n
-        mean_y = sum(ys) / n
-        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / n
-        std_x = (sum((x - mean_x) ** 2 for x in xs) / n) ** 0.5
-        std_y = (sum((y - mean_y) ** 2 for y in ys) / n) ** 0.5
-        corr = cov / (std_x * std_y) if std_x > 0 and std_y > 0 else 0
+    # Context analysis (if available)
+    ctx_runs = [r for r in runs if r.get("context")]
+    if ctx_runs:
         print()
-        print(f"  Pearson correlation (context_size vs TTFT): r = {corr:.3f}")
-        print(f"  Samples: {n}")
-        if abs(corr) > 0.7:
-            print("  → 强正相关：context 越大，TTFT 越长")
-        elif abs(corr) > 0.4:
-            print("  → 中等相关：context 大小对 TTFT 有一定影响")
-        else:
-            print("  → 弱相关：TTFT 主要受其他因素影响（服务端调度、模型负载等）")
+        print("━" * 80)
+        print("  CONTEXT SIZE vs LATENCY")
+        print("━" * 80)
+        print()
+        for run in ctx_runs:
+            ctx = run["context"]
+            sys_chars = int(ctx.get("systemPromptChars") or 0)
+            hist_chars = int(ctx.get("historyTextChars") or 0)
+            total_chars = sys_chars + hist_chars
+            calls = run["model_calls"]
+            first_ttft = calls[0].get("ttftMs") if calls else None
+            first_dur = calls[0].get("durationMs") if calls else None
+            print(f"  trace={run['traceId']} ctx_chars={total_chars:,} first_call={first_dur}ms ttft={first_ttft}ms")
+
+    # Token-based analysis (for 2026.5.7 without context.assembled)
+    tok_runs = [r for r in runs if r.get("_loop_total_tokens") or (r["model_calls"] and r["model_calls"][0].get("totalTokens"))]
+    if tok_runs and not ctx_runs:
+        print()
+        print("━" * 80)
+        print("  TOTAL TOKENS vs LATENCY (context.assembled unavailable, using token counts)")
+        print("━" * 80)
+        print()
+        print(f"  {'total_tokens':>12} {'first_call_ms':>14} {'e2e_ms':>10}")
+        print(f"  {'─'*12} {'─'*14} {'─'*10}")
+        for run in tok_runs:
+            total = run.get("_loop_total_tokens") or (run["model_calls"][0]["totalTokens"] if run["model_calls"] else 0)
+            first = run["model_calls"][0]["durationMs"] if run["model_calls"] else None
+            e2e = run["e2eMs"]
+            print(f"  {total:>12,} {f'{first}ms':>14} {f'{e2e}ms' if e2e else '?':>10}")
 
     print()
-    print("━" * 76)
+    print("━" * 80)
+    if not ctx_runs:
+        print("  Note: context.assembled spans not available (requires OpenClaw >= 2026.5.12)")
+        print("  Using total_tokens as context size proxy for correlation analysis.")
+    print("━" * 80)
 
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PATH
     if not Path(path).exists():
-        print(f"Error: {path} not found. 等数据积累后再跑。")
+        print(f"Error: {path} not found.")
         sys.exit(1)
 
     traces = parse_traces(path)
     runs = extract_runs(traces)
 
     if not runs:
-        print("No model call data found yet. 发几条消息等数据积累。")
+        print("No data found. 确认 agent 已完成至少一次回复。")
         sys.exit(0)
 
     print_report(runs)
