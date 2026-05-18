@@ -5,7 +5,7 @@
 ## 采集指标
 
 - **E2E 延迟**：从 Gateway 收到消息到回复发出（`e2eMs`）
-- **阶段拆分**：Gateway / Agent run / Delivery（`stages.{gatewayMs,agentRunMs,deliveryMs}`）
+- **阶段拆分**：上游送达 → Agent 处理 → 回复发出（`stages.{gatewayMs,agentRunMs,deliveryMs}`）。`gatewayMs` 指上游送达 → Agent 开始处理的延迟（含网络/排队，由 `evt.timestamp` 决定）
 - **模型 TTFT**：每次 model call 的 Time To First Byte（精确值，来自 streaming 层）
 - **模型生成时间**：duration − TTFT = 纯 token 生成耗时
 - **工具执行耗时**：每次 tool call 的 duration

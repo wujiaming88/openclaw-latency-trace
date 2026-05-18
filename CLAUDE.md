@@ -31,21 +31,36 @@ Subscribed events:
 | Event | What it does |
 |---|---|
 | `message_received` | Stamps `messageReceivedAt` (E2E start). If runId is unknown yet, parks an orphan keyed by sessionKey for later attach |
-| `before_agent_run` | Stamps `agentStartAt` (Gateway → Agent boundary) |
-| `llm_input` | Captures system / prompt / history UTF-8 bytes; cached on the run, drained onto the next `model_call_ended` detail |
+| `before_agent_run` | Stamps `agentStartAt` (Gateway → Agent boundary). Captures `systemPromptBytes` once per run from `evt.systemPrompt` |
+| `before_prompt_build` | Captures `prompt` + `messages` UTF-8 bytes for the upcoming model call; cached on the run, drained onto the next `model_call_ended` detail |
 | `model_call_started` | Flushes stale runs; creates/updates the run record; backfills `agentStartAt`; stamps `provider`, `model` |
-| `model_call_ended` | Pushes a model-call detail entry (incl. cached `context`); updates `lastModelCallEndedAt`; schedules a flush in `FLUSH_DELAY_MS` (3s) |
-| `agent_end` | Stamps `agentEndAt` (Agent → Delivery boundary) |
-| `message_sent` | Stamps `messageSentAt` (E2E end) |
-| `before_tool_call` | Cancels pending flush; starts the tool stopwatch |
+| `model_call_ended` | Pushes a model-call detail entry (incl. cached `context`); updates `lastModelCallEndedAt` |
+| `agent_end` | Stamps `agentEndAt` (Agent → Delivery boundary); schedules a 15s fallback flush in case `message_sent` never arrives |
+| `message_sent` | Stamps `messageSentAt` (E2E end) and flushes immediately |
+| `before_tool_call` | Cancels pending flush (defensive); starts the tool stopwatch |
 | `after_tool_call` | Pushes a tool-call detail entry |
+
+Hook choice rationale: the legacy `llm_input` hook is gated by
+`!skipPromptSubmission && !isRawModelRun && hasHooks("llm_input")` in OpenClaw
+≥ 2026.5.12 and silently no-ops on the Feishu / Bedrock embedded path. The pair
+`before_agent_run` (run-level systemPrompt) + `before_prompt_build` (per-call
+prompt + messages) is gated only by `hasHooks(...)` and reliably fires on every
+production path we've observed. This is why context lives on `model.detail[i]`
+(per-call) rather than at the run level — `before_prompt_build` fires once per
+model call and may carry different `messages` each time.
 
 State lives in a process-local `Map<runId, run>` plus a `Map<sessionKey, runId>`
 index for events whose `runId` arrives later than the wall-clock anchor. A run
 is flushed when:
-- 3s elapse after the last `model_call_ended` with no further activity, or
+- `message_sent` fires (immediate flush — this is the normal path), or
+- 15s elapse after `agent_end` with no `message_sent` (fallback when delivery
+  fails or the gateway drops the event), or
 - A new run starts (previous runs with model calls are flushed eagerly), or
 - The 60s sweeper finds a run older than 10 minutes.
+
+The `sessionKey → runId` index is retained for 60s after flush so a
+late-arriving event can still resolve to the (already-written) run id without
+spawning a phantom record.
 
 If `agent_end` never fires, `agentRunMs` falls back to
 `lastModelCallEndedAt − agentStartAt`. Any missing time anchor produces `null`
@@ -76,7 +91,7 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `sessionKey` | string | OpenClaw session key |
 | `provider` | string | LLM provider id from first model call |
 | `e2eMs` | number\|null | `messageSentAt − messageReceivedAt` |
-| `stages.gatewayMs` | number\|null | `agentStartAt − messageReceivedAt` |
+| `stages.gatewayMs` | number\|null | `agentStartAt − messageReceivedAt` — upstream-delivery → agent-start latency (network + queueing; `messageReceivedAt` comes from `evt.timestamp`) |
 | `stages.agentRunMs` | number\|null | `(agentEndAt ?? lastModelCallEndedAt) − agentStartAt` |
 | `stages.deliveryMs` | number\|null | `messageSentAt − (agentEndAt ?? lastModelCallEndedAt)` |
 | `model.calls` | number | model call count |
@@ -86,7 +101,7 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `model.avgTtftMs` | number\|null | mean TTFT |
 | `model.firstCallTtftMs` | number\|null | TTFT of first model call |
 | `model.detail[]` | array | per-call: `{provider, model, outcome, durationMs, ttftMs, responseBytes, context?}` |
-| `model.detail[].context` | object | UTF-8 bytes from `llm_input`: `{systemPromptBytes, promptBytes, historyBytes, totalContextBytes, imagesCount}` |
+| `model.detail[].context` | object | UTF-8 bytes captured at `before_prompt_build` (+ `systemPromptBytes` from `before_agent_run`): `{systemPromptBytes, promptBytes, historyBytes, totalContextBytes, imagesCount}`. `imagesCount` is `0` until `before_prompt_build` carries one |
 | `tools.calls` | number | tool call count |
 | `tools.totalMs` | number | sum of tool durations |
 | `tools.detail[]` | array | per-call: `{name, durationMs, error}` |

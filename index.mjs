@@ -8,7 +8,8 @@ try { mkdirSync(dirname(OUTPUT), { recursive: true }); } catch (_) {}
 const runs = new Map();
 const sessionToRun = new Map();
 const orphanReceived = new Map();
-const FLUSH_DELAY_MS = 3000;
+const AGENT_END_FLUSH_DELAY_MS = 15_000;
+const SESSION_INDEX_TTL_MS = 60_000;
 const ORPHAN_TTL_MS = 60_000;
 
 function utf8(s) { return Buffer.byteLength(s ?? "", "utf8"); }
@@ -23,6 +24,7 @@ function getRun(runId, sessionKey) {
       agentStartAt: null, agentEndAt: null, messageSentAt: null,
       lastModelCallEndedAt: null,
       provider: null, model: null,
+      systemPromptBytes: 0,
       modelCalls: [], toolCalls: [],
       _pendingContext: null, _toolT0: null, _toolName: null,
       _flushTimer: null,
@@ -45,9 +47,9 @@ function findRun(evt, ctx) {
   return null;
 }
 
-function scheduleFlush(run) {
+function scheduleFlush(run, delayMs) {
   if (run._flushTimer) clearTimeout(run._flushTimer);
-  run._flushTimer = setTimeout(() => flush(run), FLUSH_DELAY_MS);
+  run._flushTimer = setTimeout(() => flush(run), delayMs);
 }
 
 function cancelFlush(run) {
@@ -91,7 +93,10 @@ function flush(run) {
   try { appendFileSync(OUTPUT, JSON.stringify(record) + "\n"); } catch (_) {}
   runs.delete(run.runId);
   if (run.sessionKey && sessionToRun.get(run.sessionKey) === run.runId) {
-    sessionToRun.delete(run.sessionKey);
+    const sk = run.sessionKey, rid = run.runId;
+    setTimeout(() => {
+      if (sessionToRun.get(sk) === rid) sessionToRun.delete(sk);
+    }, SESSION_INDEX_TTL_MS).unref();
   }
 }
 
@@ -125,21 +130,23 @@ export default {
 
     api.on("before_agent_run", (evt, ctx) => {
       const r = findRun(evt, ctx);
-      if (r && !r.agentStartAt) r.agentStartAt = Date.now();
+      if (!r) return;
+      if (!r.agentStartAt) r.agentStartAt = Date.now();
+      r.systemPromptBytes = utf8(evt?.systemPrompt);
     });
 
-    api.on("llm_input", (evt, ctx) => {
+    api.on("before_prompt_build", (evt, ctx) => {
       const r = findRun(evt, ctx);
       if (!r) return;
-      const systemPromptBytes = utf8(evt.systemPrompt);
-      const promptBytes = utf8(evt.prompt);
-      const historyBytes = utf8(JSON.stringify(evt.historyMessages || []));
+      const promptBytes = utf8(evt?.prompt);
+      const historyBytes = utf8(JSON.stringify(evt?.messages || []));
+      const sysBytes = r.systemPromptBytes ?? 0;
       r._pendingContext = {
-        systemPromptBytes,
+        systemPromptBytes: sysBytes,
         promptBytes,
         historyBytes,
-        totalContextBytes: systemPromptBytes + promptBytes + historyBytes,
-        imagesCount: evt.imagesCount ?? 0,
+        totalContextBytes: sysBytes + promptBytes + historyBytes,
+        imagesCount: 0,
       };
     });
 
@@ -170,17 +177,22 @@ export default {
         r._pendingContext = null;
       }
       r.modelCalls.push(detail);
-      scheduleFlush(r);
     });
 
     api.on("agent_end", (evt, ctx) => {
       const r = findRun(evt, ctx);
-      if (r && !r.agentEndAt) r.agentEndAt = Date.now();
+      if (!r) return;
+      if (!r.agentEndAt) r.agentEndAt = Date.now();
+      cancelFlush(r);
+      scheduleFlush(r, AGENT_END_FLUSH_DELAY_MS);
     });
 
     api.on("message_sent", (evt, ctx) => {
       const r = findRun(evt, ctx);
-      if (r) r.messageSentAt = evt?.timestamp ?? Date.now();
+      if (!r) return;
+      r.messageSentAt = evt?.timestamp ?? Date.now();
+      cancelFlush(r);
+      flush(r);
     });
 
     api.on("before_tool_call", (evt, ctx) => {
