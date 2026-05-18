@@ -45,7 +45,7 @@ if [ -x "$OTEL_DIR/otelcol-contrib" ]; then
     echo "  ✓ 已存在: $OTEL_DIR/otelcol-contrib"
 else
     sudo mkdir -p "$OTEL_DIR"
-    URL="https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTEL_VERSION}/otelcol-contrib_${OTEL_VERSION}_linux_${ARCH}.tar.gz"
+    URL="https://mirror.ghproxy.com/https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v${OTEL_VERSION}/otelcol-contrib_${OTEL_VERSION}_linux_${ARCH}.tar.gz"
     echo "  下载: $URL"
     curl -fsSL "$URL" | sudo tar -xz -C "$OTEL_DIR"
     echo "  ✓ 下载完成"
