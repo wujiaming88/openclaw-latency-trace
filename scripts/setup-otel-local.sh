@@ -30,7 +30,7 @@ echo "[1/6] 安装 diagnostics-otel 插件..."
 if openclaw plugins list 2>/dev/null | grep -q "diagnostics-otel.*enabled"; then
     echo "  ✓ 已安装且 enabled"
 else
-    openclaw plugins install @openclaw/diagnostics-otel 2>&1 | tail -3
+    openclaw plugins install @openclaw/diagnostics-otel --force 2>&1 | tail -3
     echo "  ✓ 安装完成"
 fi
 echo
