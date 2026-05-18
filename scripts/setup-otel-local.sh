@@ -17,10 +17,12 @@ echo
 
 # ─── 1. 安装 diagnostics-otel 插件 ───────────────────────────────────────────
 echo "[1/6] diagnostics-otel 插件..."
-if openclaw plugins list 2>/dev/null | grep -q "diagnost.*enabled"; then
-    echo "  ✓ 已 enabled，跳过"
+if [ -d "$HOME/.openclaw/npm/node_modules/@openclaw/diagnostics-otel" ]; then
+    echo "  ✓ 已安装，跳过"
+elif openclaw plugins list 2>/dev/null | grep -q "diagnost"; then
+    echo "  ✓ 已注册，跳过"
 else
-    openclaw plugins install @openclaw/diagnostics-otel --force 2>&1 | tail -3 || true
+    openclaw plugins install @openclaw/diagnostics-otel 2>&1 | tail -3 || true
     echo "  ✓ 完成"
 fi
 echo
