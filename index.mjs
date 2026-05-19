@@ -1,10 +1,46 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 
 const OUTPUT = process.env.LATENCY_TRACE_OUTPUT
   || join(process.env.OPENCLAW_LOG_DIR || "/tmp/openclaw", "latency-trace.jsonl");
 try { mkdirSync(dirname(OUTPUT), { recursive: true }); } catch (_) {}
+
+// Global event-loop delay histogram. Shared across all runs by design — the
+// signal we want is "is the gateway process blocked", which is global. A
+// per-run histogram would be both expensive (one ELDHistogram per concurrent
+// run) and noisy (each sees only a fraction of the timeline). Trade-off:
+// concurrent flushes will reset each other's window. Acceptable because the
+// first concurrent flush still surfaces blockage and the retained window
+// length is reported as `eventLoop.windowMs`.
+const elHistogram = monitorEventLoopDelay({ resolution: 20 });
+elHistogram.enable();
+let elHistogramResetAt = Date.now();
+
+function readEventLoopMetrics() {
+  const now = Date.now();
+  const count = elHistogram.count;
+  const windowMs = now - elHistogramResetAt;
+  const result = {
+    delayP50Ms: null,
+    delayP95Ms: null,
+    delayP99Ms: null,
+    delayMaxMs: null,
+    windowMs: count > 0 ? windowMs : null,
+  };
+  if (count > 0) {
+    try {
+      result.delayP50Ms = Math.round((elHistogram.percentile(50) / 1e6) * 10) / 10;
+      result.delayP95Ms = Math.round((elHistogram.percentile(95) / 1e6) * 10) / 10;
+      result.delayP99Ms = Math.round((elHistogram.percentile(99) / 1e6) * 10) / 10;
+      result.delayMaxMs = Math.round((elHistogram.max / 1e6) * 10) / 10;
+    } catch (_) {}
+  }
+  elHistogram.reset();
+  elHistogramResetAt = now;
+  return result;
+}
 
 const runs = new Map();
 const sessionToRun = new Map();
@@ -78,6 +114,7 @@ function getRun(runId, sessionKey) {
       messageReceivedAt: orphan?.at ?? null,
       agentStartAt: null, agentEndAt: null, messageSentAt: null,
       lastModelCallEndedAt: null,
+      _beforePromptBuildAt: null, _beforeAgentRunAt: null, _modelCallStartedAt: null,
       provider: null, model: null,
       modelCalls: [], toolCalls: [],
       _pendingContext: null, _toolT0: null, _toolName: null,
@@ -129,13 +166,29 @@ function flush(run) {
   const e2eMs = (gatewayMs != null && agentRunMs != null)
     ? gatewayMs + agentRunMs : null;
 
+  // Gateway sub-stages. Use max(0, …) because OpenClaw hook order is not
+  // strictly guaranteed across paths (model_call_started can fire before
+  // before_agent_run on fallback paths), and we never want negatives in the
+  // trace.
+  const preludeMs = (run._beforePromptBuildAt && run.messageReceivedAt)
+    ? Math.max(0, run._beforePromptBuildAt - run.messageReceivedAt) : null;
+  const promptBuildMs = (run._beforeAgentRunAt && run._beforePromptBuildAt)
+    ? Math.max(0, run._beforeAgentRunAt - run._beforePromptBuildAt) : null;
+  const beforeAgentRunMs = (run._modelCallStartedAt && run._beforeAgentRunAt)
+    ? Math.max(0, run._modelCallStartedAt - run._beforeAgentRunAt) : null;
+
   const record = {
     ts: new Date().toISOString(),
     runId: run.runId,
     sessionKey: run.sessionKey,
     provider: run.provider,
     e2eMs,
-    stages: { gatewayMs, agentRunMs },
+    stages: {
+      gatewayMs,
+      agentRunMs,
+      gateway: { preludeMs, promptBuildMs, beforeAgentRunMs },
+    },
+    eventLoop: readEventLoopMetrics(),
     model: {
       calls: run.modelCalls.length,
       totalMs: modelMs,
@@ -188,12 +241,15 @@ export default {
     api.on("before_agent_run", (evt, ctx) => {
       const r = findRun(evt, ctx);
       if (!r) return;
-      if (!r.agentStartAt) r.agentStartAt = Date.now();
+      const now = Date.now();
+      if (!r._beforeAgentRunAt) r._beforeAgentRunAt = now;
+      if (!r.agentStartAt) r.agentStartAt = now;
     });
 
     api.on("before_prompt_build", (evt, ctx) => {
       const r = findRun(evt, ctx);
       if (!r) return;
+      if (!r._beforePromptBuildAt) r._beforePromptBuildAt = Date.now();
       r._pendingContext = {
         promptBytes: utf8(evt?.prompt),
         historyBytes: utf8(JSON.stringify(evt?.messages || [])),
@@ -205,7 +261,9 @@ export default {
       flushPreviousRuns(evt.runId);
       const r = getRun(evt.runId, evt.sessionKey || ctx?.sessionKey);
       if (!r) return;
-      if (!r.agentStartAt) r.agentStartAt = Date.now();
+      const now = Date.now();
+      if (!r._modelCallStartedAt) r._modelCallStartedAt = now;
+      if (!r.agentStartAt) r.agentStartAt = now;
       r.provider = evt.provider;
       r.model = evt.model;
     });

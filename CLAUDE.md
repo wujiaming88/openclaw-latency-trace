@@ -14,8 +14,8 @@ JSONL file. Nothing else lives here.
    gateway recovery tools, generic setup helpers). If a tool is useful but not
    *this plugin*, it belongs in a different repo.
 2. **Zero npm dependencies.** Node.js built-ins only (`node:fs`, `node:path`,
-   `node:os`, `node:util`). Do not add `dependencies` or `devDependencies` to
-   package.json.
+   `node:os`, `node:util`, `node:perf_hooks`, `node:test`, `node:assert`). Do
+   not add `dependencies` or `devDependencies` to package.json.
 3. **No bloat in README.** README structure is fixed: capabilities → install →
    verify → jq recipes → env vars → requirements → license. Do not pad it.
 4. **No project scaffolding.** No CI, no GitHub Actions, no issue templates, no
@@ -32,9 +32,9 @@ Subscribed events:
 | Event | What it does |
 |---|---|
 | `message_received` | Stamps `messageReceivedAt` (E2E start). If runId is unknown yet, parks an orphan keyed by sessionKey for later attach |
-| `before_agent_run` | Stamps `agentStartAt` (Gateway → Agent boundary) |
-| `before_prompt_build` | Captures `prompt` + `messages` UTF-8 bytes for the upcoming model call; cached on the run, drained onto the next `model_call_ended` detail |
-| `model_call_started` | Flushes stale runs; creates/updates the run record; backfills `agentStartAt`; stamps `provider`, `model` |
+| `before_agent_run` | Stamps `agentStartAt` (Gateway → Agent boundary) **and** `_beforeAgentRunAt` (gateway sub-stage anchor) |
+| `before_prompt_build` | Stamps `_beforePromptBuildAt` (gateway sub-stage anchor; first call wins). Captures `prompt` + `messages` UTF-8 bytes for the upcoming model call; cached on the run, drained onto the next `model_call_ended` detail |
+| `model_call_started` | Stamps `_modelCallStartedAt` (gateway sub-stage anchor; first call wins). Flushes stale runs; creates/updates the run record; backfills `agentStartAt`; stamps `provider`, `model` |
 | `model_call_ended` | Reads `systemPromptReport` chars from the trajectory file, merges with cached prompt/history bytes, pushes a model-call detail entry; updates `lastModelCallEndedAt` |
 | `agent_end` | Stamps `agentEndAt` **and** `messageSentAt` (treated as the E2E endpoint — see *Why no delivery latency*); flushes immediately |
 | `before_tool_call` | Starts the tool stopwatch |
@@ -106,6 +106,12 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `e2eMs` | number\|null | `agentEndAt − messageReceivedAt` (== `stages.gatewayMs + stages.agentRunMs`). Does **not** include the channel-API send leg — see *Why no delivery latency* |
 | `stages.gatewayMs` | number\|null | `agentStartAt − messageReceivedAt` — upstream-delivery → agent-start latency (network + queueing; `messageReceivedAt` comes from `evt.timestamp`) |
 | `stages.agentRunMs` | number\|null | `(agentEndAt ?? lastModelCallEndedAt) − agentStartAt` |
+| `stages.gateway.preludeMs` | number\|null | `_beforePromptBuildAt − messageReceivedAt`. Gateway-side hook chain before prompt build kicks in. Clamped to 0 |
+| `stages.gateway.promptBuildMs` | number\|null | `_beforeAgentRunAt − _beforePromptBuildAt`. Prompt build + context injection. Clamped to 0 |
+| `stages.gateway.beforeAgentRunMs` | number\|null | `_modelCallStartedAt − _beforeAgentRunAt`. Falls inside `agentRunMs`, not `gatewayMs` — listed under `gateway.*` because it's the last hook stage before model call. Clamped to 0 |
+| `eventLoop.delayP{50,95,99}Ms` | number\|null | Process-level event loop delay percentiles since last flush, ms |
+| `eventLoop.delayMaxMs` | number\|null | Window max ms |
+| `eventLoop.windowMs` | number\|null | Time window covered (last reset → flush). `null` if histogram had no samples |
 | `model.calls` | number | model call count |
 | `model.totalMs` | number | sum of model call durations |
 | `model.totalTtftMs` | number | sum of TTFTs |
@@ -154,6 +160,40 @@ the authoritative chars breakdown — the same numbers it logs as
 - We don't fake a unified field. Users who want a total run `jq
   '.context.promptBytes + .context.historyBytes'` and look at chars
   separately.
+
+## Gateway sub-stages and event loop histogram (v1.1+)
+
+`stages.gateway.{preludeMs, promptBuildMs, beforeAgentRunMs}` decompose what
+used to be an opaque `gatewayMs` number into the three hook intervals before
+the first model call. The intervals can independently be `null` if their
+endpoint hook never fired on a given path. They are computed with
+`Math.max(0, end − start)` because OpenClaw's hook order is not strictly
+guaranteed across paths (e.g. `model_call_started` can fire before
+`before_agent_run` in fallback paths). The classic invariants still hold —
+`stages.gatewayMs` and `stages.agentRunMs` are unchanged from v1.0, and
+`preludeMs + promptBuildMs == gatewayMs` whenever both sub-stages are
+non-null.
+
+`eventLoop` reports a process-level event loop delay histogram from
+`perf_hooks.monitorEventLoopDelay({ resolution: 20 })`. The histogram is
+**global / shared across runs** — it is enabled once at module load, read at
+each flush, and reset. Trade-off: concurrent flushes will reset each other's
+window. This is acceptable because the signal we care about (is the gateway
+process blocked?) is process-global, not per-run, and a per-run histogram
+would be both expensive (one ELDHistogram per concurrent run) and noisier
+(each sample partitioned across many windows). When the histogram has no
+samples (e.g. two flushes happen synchronously within a single tick), all
+five `eventLoop.*` fields are `null`. Histogram values from `perf_hooks` are
+**nanoseconds**; the plugin converts to ms before writing.
+
+## Tests
+
+`npm test` runs `node --test test/*.test.mjs`. Tests are zero-dep
+(`node:test` + `node:assert`) and import `index.mjs` with a cache-busting
+query string per test so each test gets a fresh module instance (fresh
+`runs` Map, fresh global histogram, fresh `OUTPUT` constant). Each test
+sets `LATENCY_TRACE_OUTPUT` to a unique tmpfile *before* dynamic-importing
+the module.
 
 ## Compatibility
 

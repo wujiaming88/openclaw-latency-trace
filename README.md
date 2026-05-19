@@ -6,6 +6,8 @@
 
 - **E2E 延迟**：从 Gateway 收到消息到 agent 完成回复（`e2eMs`）。不含 channel API 投递的最后几百毫秒（OpenClaw 上游未在投递路径暴露 runId 关联，无法测量）
 - **阶段拆分**：Gateway 开销 → Agent 处理（`stages.{gatewayMs,agentRunMs}`）。`gatewayMs` 指上游送达 → Agent 开始处理的延迟（含网络/排队，由 `evt.timestamp` 决定）
+- **Gateway 子分段**（v1.1+）：把 `gatewayMs` 拆成 `prelude / promptBuild / beforeAgentRun` 三段，定位是哪个 hook 阶段慢
+- **Event loop 阻塞**（v1.1+）：用 `perf_hooks` ELDHistogram 监测进程级 event loop delay（区分 channel-level sync 阻塞 vs hook-level 慢）
 - **模型 TTFT**：每次 model call 的 Time To First Byte（精确值，来自 streaming 层）
 - **模型生成时间**：duration − TTFT = 纯 token 生成耗时
 - **工具执行耗时**：每次 tool call 的 duration
@@ -49,7 +51,39 @@ jq -r '.model.detail[] | select(.ttftMs != null and .context != null) | [.contex
 
 # 阶段拆分占比（gateway / agent）
 jq 'select(.e2eMs != null) | {e2e: .e2eMs, gw: .stages.gatewayMs, ag: .stages.agentRunMs}' /tmp/openclaw/latency-trace.jsonl
+
+# Gateway 子分段：哪一段慢？
+jq 'select(.stages.gatewayMs > 1000) | {gw: .stages.gatewayMs, prelude: .stages.gateway.preludeMs, promptBuild: .stages.gateway.promptBuildMs, beforeAgentRun: .stages.gateway.beforeAgentRunMs}' /tmp/openclaw/latency-trace.jsonl
+
+# Event loop 阻塞排查：max delay > 100ms 的 run
+jq 'select(.eventLoop.delayMaxMs > 100) | {ts, runId, e2e: .e2eMs, gw: .stages.gatewayMs, elMax: .eventLoop.delayMaxMs, elP99: .eventLoop.delayP99Ms}' /tmp/openclaw/latency-trace.jsonl
 ```
+
+## 新增字段（v1.1）
+
+### `stages.gateway`
+
+把 `stages.gatewayMs` 拆成三段（单调时间戳，缺数据则字段为 `null`）：
+
+| 字段 | 区间 | 包含什么 |
+|---|---|---|
+| `preludeMs` | `message_received` → `before_prompt_build` | gateway 收到消息到开始构建 prompt（路由、auth、history fetch 等） |
+| `promptBuildMs` | `before_prompt_build` → `before_agent_run` | prompt 构建 + 上下文注入耗时（含 systemPrompt 渲染） |
+| `beforeAgentRunMs` | `before_agent_run` → `model_call_started` | agent 启动到第一次 model 调用（image 下载、auth、modifying hook 链） |
+
+注意：`beforeAgentRunMs` 落在 agent 阶段（`agentStartAt` 设在 `before_agent_run`），不是 gateway 段；列在 `stages.gateway` 下是因为它是 model call 之前的 hook 阶段，跟前两段一起回答"model 之前在等什么"。`preludeMs + promptBuildMs == gatewayMs`。
+
+### `eventLoop`
+
+进程级 event loop delay histogram（来自 `perf_hooks.monitorEventLoopDelay`，分辨率 20ms）：
+
+| 字段 | 含义 |
+|---|---|
+| `delayP50Ms / delayP95Ms / delayP99Ms` | 延迟分位数 |
+| `delayMaxMs` | 窗口内最大单次 delay |
+| `windowMs` | 上次 reset 到本次 flush 的时间窗 |
+
+每次 flush 后 histogram reset。**全局共享**：多个并发 run 同时 flush 会相互重置窗口，看到的是进程级阻塞信号，不是 per-run 隔离值。这个 trade-off 是有意为之 —— 主要目标是发现 gateway 进程是否被 sync 代码阻塞（如 channel adapter 的 `start-account`），不需要 per-run 精度。无样本时所有字段为 `null`。
 
 ## 环境变量
 
