@@ -107,8 +107,8 @@ One line per agent run, written to `$LATENCY_TRACE_OUTPUT` (default
 | `stages.gatewayMs` | number\|null | `agentStartAt − messageReceivedAt` — upstream-delivery → agent-start latency (network + queueing; `messageReceivedAt` comes from `evt.timestamp`) |
 | `stages.agentRunMs` | number\|null | `(agentEndAt ?? lastModelCallEndedAt) − agentStartAt` |
 | `stages.gateway.preludeMs` | number\|null | `_beforePromptBuildAt − messageReceivedAt`. Gateway-side hook chain before prompt build kicks in. Clamped to 0 |
-| `stages.gateway.promptBuildMs` | number\|null | `_beforeAgentRunAt − _beforePromptBuildAt`. Prompt build + context injection. Clamped to 0 |
-| `stages.gateway.beforeAgentRunMs` | number\|null | `_modelCallStartedAt − _beforeAgentRunAt`. Falls inside `agentRunMs`, not `gatewayMs` — listed under `gateway.*` because it's the last hook stage before model call. Clamped to 0 |
+| `stages.gateway.promptBuildMs` | number\|null | `(_beforeAgentRunAt ?? _modelCallStartedAt) − _beforePromptBuildAt`. Prompt build + context injection. Right edge falls back to `_modelCallStartedAt` when `before_agent_run` is unsubscribed (see *Subscriber-only hooks* below); in that fallback case the figure spans both prompt build **and** the (untriggered) before-agent hook chain. Clamped to 0 |
+| `stages.gateway.beforeAgentRunMs` | number\|null | `_modelCallStartedAt − _beforeAgentRunAt`. Falls inside `agentRunMs`, not `gatewayMs` — listed under `gateway.*` because it's the last hook stage before model call. `null` when `before_agent_run` is unsubscribed (no anchor — no fallback). Clamped to 0 |
 | `eventLoop.delayP{50,95,99}Ms` | number\|null | Process-level event loop delay percentiles since last flush, ms |
 | `eventLoop.delayMaxMs` | number\|null | Window max ms |
 | `eventLoop.windowMs` | number\|null | Time window covered (last reset → flush). `null` if histogram had no samples |
@@ -172,7 +172,34 @@ guaranteed across paths (e.g. `model_call_started` can fire before
 `before_agent_run` in fallback paths). The classic invariants still hold —
 `stages.gatewayMs` and `stages.agentRunMs` are unchanged from v1.0, and
 `preludeMs + promptBuildMs == gatewayMs` whenever both sub-stages are
-non-null.
+non-null **and** `before_agent_run` actually fired (see *Subscriber-only
+hooks* below for the fallback case).
+
+### Subscriber-only hooks (v1.1.1)
+
+`before_agent_run` is a *subscriber-only* hook: OpenClaw's hook runner
+short-circuits and never fires it on agent paths where no plugin has
+subscribed (`if (hookRunner?.hasHooks("before_agent_run"))` in
+`selection.js`). On those paths `_beforeAgentRunAt` stays `null` for the
+entire run.
+
+The plugin handles this gracefully:
+
+- `promptBuildMs` falls back to `_modelCallStartedAt` for the right edge.
+  The reported value covers prompt build **plus** the (untriggered)
+  before-agent hook chain merged together — there's no way to tell them
+  apart without the missing anchor, and zero is the wrong answer because
+  `_modelCallStartedAt − _beforePromptBuildAt` is genuinely how long the
+  gateway took to reach the first model call.
+- `beforeAgentRunMs` reports `null`. Without `_beforeAgentRunAt` there is
+  no honest way to split that interval out from `promptBuildMs`, so we
+  refuse to fabricate a number.
+- `gatewayMs` (v1.0 invariant) is unaffected because `model_call_started`
+  backfills `agentStartAt` when `before_agent_run` never fired.
+
+In practice: if your trace shows `promptBuildMs` populated but
+`beforeAgentRunMs: null`, no plugin is subscribed to `before_agent_run` on
+that agent's path. Subscribe one (even a no-op) to get the breakdown back.
 
 `eventLoop` reports a process-level event loop delay histogram from
 `perf_hooks.monitorEventLoopDelay({ resolution: 20 })`. The histogram is

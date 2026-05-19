@@ -95,7 +95,12 @@ test("before_prompt_build absent: prelude/promptBuild null, beforeAgentRunMs OK"
   cleanup(tmp);
 });
 
-test("before_agent_run absent: agentStartAt fallback to model_call_started", async () => {
+test("before_agent_run unsubscribed (v1.1.1): promptBuildMs falls back to model_call_started, beforeAgentRunMs stays null", async () => {
+  // Scenario: OpenClaw paths where no plugin subscribes to before_agent_run.
+  // The hook runner short-circuits and never fires it
+  // (`if (hookRunner?.hasHooks("before_agent_run"))` in selection.js), so
+  // _beforeAgentRunAt stays null. v1.1.1 falls back to _modelCallStartedAt
+  // for the right edge of promptBuildMs while leaving beforeAgentRunMs null.
   const { tmp, handlers } = await setup();
   const runId = "no-bar";
   const sessionKey = "agent:foo:c";
@@ -104,8 +109,8 @@ test("before_agent_run absent: agentStartAt fallback to model_call_started", asy
   handlers.message_received({ runId, sessionKey, timestamp: t0 });
   await sleep(10);
   handlers.before_prompt_build({ runId, sessionKey, prompt: "hi", messages: [] });
-  await sleep(10);
-  // Skip before_agent_run
+  await sleep(15);
+  // Skip before_agent_run entirely — simulating an unsubscribed hook path.
   handlers.model_call_started({ runId, sessionKey, provider: "p", model: "m" });
   handlers.model_call_ended({ runId, sessionKey, durationMs: 50, timeToFirstByteMs: 25 });
   handlers.agent_end({ runId, sessionKey });
@@ -114,14 +119,30 @@ test("before_agent_run absent: agentStartAt fallback to model_call_started", asy
   assert.equal(lines.length, 1);
   const r = lines[0];
 
+  // beforeAgentRunMs has no anchor — must remain null (no fabrication).
   assert.equal(r.stages.gateway.beforeAgentRunMs, null);
-  assert.equal(r.stages.gateway.promptBuildMs, null);
-  // preludeMs is observable (msgReceived -> beforePromptBuild)
+
+  // promptBuildMs must now fall back to _modelCallStartedAt (v1.1.1 fix).
+  // Before v1.1.1 this was null; the merged figure spans prompt build + the
+  // (untriggered) before-agent hook chain, which is the most honest number
+  // we can report without the missing anchor.
+  assert.equal(typeof r.stages.gateway.promptBuildMs, "number");
+  assert.ok(r.stages.gateway.promptBuildMs >= 15,
+    `promptBuildMs ${r.stages.gateway.promptBuildMs} should reflect the ~15ms gap between before_prompt_build and model_call_started`);
+
+  // preludeMs is observable (msgReceived -> beforePromptBuild).
   assert.equal(typeof r.stages.gateway.preludeMs, "number");
   assert.ok(r.stages.gateway.preludeMs >= 0);
-  // gatewayMs still computed via fallback (agentStartAt set by model_call_started)
+
+  // gatewayMs still computed via existing fallback (agentStartAt set by
+  // model_call_started when before_agent_run never fired).
   assert.equal(typeof r.stages.gatewayMs, "number");
   assert.ok(r.stages.gatewayMs >= 0);
+
+  // Invariant: when before_agent_run is unsubscribed, agentStartAt ==
+  // _modelCallStartedAt, so preludeMs + promptBuildMs ≈ gatewayMs (both end
+  // at model_call_started in this fallback path).
+  assert.equal(r.stages.gateway.preludeMs + r.stages.gateway.promptBuildMs, r.stages.gatewayMs);
 
   cleanup(tmp);
 });

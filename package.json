@@ -1,6 +1,6 @@
 {
   "name": "openclaw-latency-trace",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "OpenClaw plugin: full-chain latency tracing with context size per model call",
   "type": "module",
   "main": "index.mjs",

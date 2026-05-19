@@ -168,12 +168,22 @@ function flush(run) {
 
   // Gateway sub-stages. Use max(0, …) because OpenClaw hook order is not
   // strictly guaranteed across paths (model_call_started can fire before
-  // before_agent_run on fallback paths), and we never want negatives in the
-  // trace.
+  // before_agent_run on fallback paths), and we never want negatives.
+  //
+  // `before_agent_run` is a *subscriber-only* hook in OpenClaw — when no
+  // plugin subscribes to it, the gateway short-circuits and never fires it
+  // (`if (hookRunner?.hasHooks("before_agent_run"))` in selection.js). On
+  // those paths `_beforeAgentRunAt` stays null. We fall back to
+  // `_modelCallStartedAt` for the right edge of `promptBuildMs` so the user
+  // still sees the prelude/build/run waterfall, accepting that this merged
+  // figure now spans both prompt build *and* the (untriggered) before-agent
+  // hook chain. `beforeAgentRunMs` itself remains null on those paths — it
+  // genuinely cannot be measured without the anchor.
   const preludeMs = (run._beforePromptBuildAt && run.messageReceivedAt)
     ? Math.max(0, run._beforePromptBuildAt - run.messageReceivedAt) : null;
-  const promptBuildMs = (run._beforeAgentRunAt && run._beforePromptBuildAt)
-    ? Math.max(0, run._beforeAgentRunAt - run._beforePromptBuildAt) : null;
+  const promptBuildEndAt = run._beforeAgentRunAt ?? run._modelCallStartedAt;
+  const promptBuildMs = (promptBuildEndAt && run._beforePromptBuildAt)
+    ? Math.max(0, promptBuildEndAt - run._beforePromptBuildAt) : null;
   const beforeAgentRunMs = (run._modelCallStartedAt && run._beforeAgentRunAt)
     ? Math.max(0, run._modelCallStartedAt - run._beforeAgentRunAt) : null;
 

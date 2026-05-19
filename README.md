@@ -71,7 +71,15 @@ jq 'select(.eventLoop.delayMaxMs > 100) | {ts, runId, e2e: .e2eMs, gw: .stages.g
 | `promptBuildMs` | `before_prompt_build` → `before_agent_run` | prompt 构建 + 上下文注入耗时（含 systemPrompt 渲染） |
 | `beforeAgentRunMs` | `before_agent_run` → `model_call_started` | agent 启动到第一次 model 调用（image 下载、auth、modifying hook 链） |
 
-注意：`beforeAgentRunMs` 落在 agent 阶段（`agentStartAt` 设在 `before_agent_run`），不是 gateway 段；列在 `stages.gateway` 下是因为它是 model call 之前的 hook 阶段，跟前两段一起回答"model 之前在等什么"。`preludeMs + promptBuildMs == gatewayMs`。
+注意：`beforeAgentRunMs` 落在 agent 阶段（`agentStartAt` 设在 `before_agent_run`），不是 gateway 段；列在 `stages.gateway` 下是因为它是 model call 之前的 hook 阶段，跟前两段一起回答"model 之前在等什么"。`preludeMs + promptBuildMs == gatewayMs`（仅当 `before_agent_run` 实际触发时；见下面的 fallback 说明）。
+
+**Subscriber-only hooks（v1.1.1）**：`before_agent_run` 是订阅触发型 hook，没有任何 plugin 订阅时 OpenClaw 不会触发它（`selection.js` 里的 `if (hookRunner?.hasHooks("before_agent_run"))` 守卫）。这种情况下：
+
+- `promptBuildMs` 退化为 `_modelCallStartedAt − _beforePromptBuildAt`，区间合并了 prompt build 和 before-agent hook 链 —— 无法拆分（缺锚点），但报零是错的（gateway 到第一次 model call 的实际耗时）
+- `beforeAgentRunMs` 报 `null`：没 `_beforeAgentRunAt` 锚点就拒绝伪造数字
+- `gatewayMs`（v1.0 不变量）不受影响：`model_call_started` 会兜底回填 `agentStartAt`
+
+如果你看到 `promptBuildMs` 有值但 `beforeAgentRunMs: null`，说明该 agent 路径上没人订阅 `before_agent_run`。订阅一个（哪怕空 handler）即可恢复细分。
 
 ### `eventLoop`
 
